@@ -1,0 +1,256 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color: #333;
+  background-color: #f5f5f7;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #e1e1e1;
+    background-color: #1e1e1e;
+  }
+}
+
+body {
+  margin: 0;
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.container {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  box-sizing: border-box;
+}
+
+.header {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  margin-bottom: 15px;
+}
+
+.logo-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.app-icon {
+  font-size: 1.5rem;
+}
+
+.app-name {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #333;
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-name {
+    color: #fff;
+  }
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 5px;
+}
+
+.tab-btn {
+  padding: 6px 14px;
+  border-radius: 15px;
+  border: 1px solid #ddd;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.9rem;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.tab-btn.active {
+  background: #007aff;
+  color: white;
+  border-color: #007aff;
+}
+
+@media (prefers-color-scheme: dark) {
+  .tab-btn {
+    background: #333;
+    border-color: #444;
+    color: #ccc;
+  }
+  .tab-btn.active {
+    background: #007aff;
+    color: white;
+  }
+}
+
+.search-box {
+  margin-bottom: 20px;
+  position: relative;
+}
+
+.search-tip {
+  font-size: 11px;
+  color: #888;
+  margin-top: 6px;
+  margin-left: 4px;
+}
+
+#search-input {
+  width: 100%;
+  padding: 10px 15px;
+  font-size: 1rem;
+  border-radius: 8px;
+  border: 1px solid #ddd;
+  background: #fff;
+  color: inherit;
+  box-sizing: border-box;
+  outline: none;
+}
+
+#search-input:focus {
+  border-color: #007aff;
+  box-shadow: 0 0 0 2px rgba(0,122,255,0.2);
+}
+
+@media (prefers-color-scheme: dark) {
+  #search-input {
+    background: #2d2d2d;
+    border-color: #444;
+  }
+}
+
+.results-list {
+  flex: 1;
+  overflow-y: auto;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px solid #ddd;
+}
+
+@media (prefers-color-scheme: dark) {
+  .results-list {
+    background: #252525;
+    border-color: #333;
+  }
+}
+
+.action-btn.success {
+  color: #28a745 !important;
+  border-color: #28a745 !important;
+}
+
+.result-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #eee;
+  transition: background-color 0.2s;
+  cursor: pointer;
+}
+
+.result-item:hover {
+  background-color: #f8f9fa;
+}
+
+@media (prefers-color-scheme: dark) {
+  .result-item {
+    border-bottom-color: #2d2d2d;
+  }
+  .result-item:hover {
+    background-color: #2d2d2d;
+  }
+}
+
+.result-icon-box {
+  font-size: 1.5rem;
+  margin-right: 12px;
+  width: 30px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.result-info {
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.result-name {
+  font-weight: 500;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-path {
+  font-size: 0.8rem;
+  color: #888;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: 15px;
+  opacity: 0.6; /* 默认半透明，悬浮时全显 */
+  transition: opacity 0.2s;
+}
+
+.result-item:hover .result-actions {
+  opacity: 1;
+}
+
+.action-btn {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+  background: #fff;
+  font-size: 0.75rem;
+  cursor: pointer;
+  color: #555;
+}
+
+.action-btn:hover {
+  background: #f0f0f0;
+  border-color: #ccc;
+}
+
+@media (prefers-color-scheme: dark) {
+  .action-btn {
+    background: #333;
+    border-color: #444;
+    color: #aaa;
+  }
+  .action-btn:hover {
+    background: #444;
+    color: #fff;
+  }
+}
+
+.placeholder, .loading, .no-results {
+  padding: 40px;
+  text-align: center;
+  color: #999;
+}

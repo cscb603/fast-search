@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>星TAP 极速搜索</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <main class="container">
+      <div class="header">
+        <div class="logo-row">
+          <span class="app-icon">🚀</span>
+          <span class="app-name">星TAP 极速搜索</span>
+        </div>
+        <div class="tabs" id="filter-tabs">
+          <button class="tab-btn active" data-type="all">全部</button>
+          <button class="tab-btn" data-type="image">图片</button>
+          <button class="tab-btn" data-type="video">视频</button>
+          <button class="tab-btn" data-type="doc">文档</button>
+          <button class="tab-btn" data-type="app">程序</button>
+          <button class="tab-btn" data-type="folder">文件夹</button>
+        </div>
+      </div>
+
+      <div class="search-box">
+        <input id="search-input" placeholder="输入关键字搜索文件 (支持中文)..." autofocus />
+        <div class="search-tip">🚀 V5.1 工业级引擎：Spotlight 全盘秒出 + 后台实时索引外接盘 <span id="indexing-status"></span></div>
+    </div>
+
+      <div id="results" class="results-list">
+        <div class="placeholder">输入关键字开始极速搜索</div>
+      </div>
+    </main>
+  </body>
+</html>

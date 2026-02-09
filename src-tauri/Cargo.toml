@@ -1,0 +1,40 @@
+[package]
+name = "tauri-app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-cli = "2"
+regex = "1.10"
+dirs = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3.31"
+
+[profile.release]
+opt-level = "z"       # 针对体积进行优化 (s 或 z)
+lto = true           # 开启链接时间优化 (Link Time Optimization)
+codegen-units = 1     # 减少编译单元以提高优化效果
+panic = "abort"       # 发生 panic 时直接终止，减少体积
+strip = true         # 自动移除调试符号 (去除符号表)
+
