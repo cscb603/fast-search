@@ -1,7 +1,7 @@
 [package]
 name = "star-tap-fast-search"
-version = "1.0.0"
-description = "星TAP 极速搜索 - 基于 Tauri 2.0 的全硬盘秒级检索工具"
+version = "2.0.0"
+description = "星TAP 极速搜索 - 基于 Tauri 2.0 的全硬盘秒级检索工具，堪比 Everything 的 Mac 极速搜索体验。"
 authors = ["星TAP实验室 <cscb603@qq.com>"]
 edition = "2021"
 
