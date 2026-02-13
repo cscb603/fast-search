@@ -1,0 +1,8 @@
+[workspace]
+members = ["src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["星TAP实验室 <cscb603@qq.com>"]
