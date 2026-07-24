@@ -109,6 +109,7 @@ pub fn has_rg() -> bool {
 fn fd_exclude_args() -> Vec<&'static str> {
     // 这些目录通常是开发/包管理/缓存，体积巨大但搜索价值低
     vec![
+        "COS_Mount", // 桌面 webdav 网盘挂载点，网络遍历极慢且无本地搜索价值
         "node_modules",
         ".git",
         "Library",
@@ -428,7 +429,6 @@ impl GlobalIndex {
             let output = if use_fd {
                 let mut cmd = AsyncCommand::new("fd");
                 cmd.arg("--hidden")
-                    .arg("--follow")
                     .arg("--absolute-path")
                     .arg("--type")
                     .arg("f")
@@ -586,7 +586,6 @@ impl GlobalIndex {
                         let output = if use_fd {
                             let mut cmd = AsyncCommand::new("fd");
                             cmd.arg("--hidden")
-                                .arg("--follow")
                                 .arg("--absolute-path")
                                 .arg("--type")
                                 .arg("f")
@@ -1553,7 +1552,6 @@ pub async fn search_content(
                     .arg("--max-depth")
                     .arg("20")
                     .arg("--hidden")
-                    .arg("--follow")
                     // 逐个排除目录（rg 不支持花括号展开）
                     .arg("--glob")
                     .arg("!.git")

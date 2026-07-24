@@ -323,7 +323,7 @@ pub fn run() {
             }
         }
         let new_path = parts.join(":");
-        let _ = std::env::set_var("PATH", new_path);
+        std::env::set_var("PATH", &new_path);
         eprintln!("[sts] PATH 已补齐: {}", new_path);
     }
 
