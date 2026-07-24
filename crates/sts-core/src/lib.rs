@@ -10,10 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::process::Command as AsyncCommand;
 
-pub mod thumbnail;
+use bm25::Bm25Index;
+use fuzzy::FuzzyMatcher;
 
-// bm25 / fuzzy / fsevents 模块需要 tantivy + notify 第三方库，
-// 当前环境版本不兼容，暂时禁用（不影响核心搜索功能）
+pub mod bm25;
+pub mod fsevents;
+pub mod fuzzy;
+pub mod thumbnail;
 
 // ============================================================
 // 公共数据结构
@@ -106,14 +109,42 @@ pub fn has_rg() -> bool {
 fn fd_exclude_args() -> Vec<&'static str> {
     // 这些目录通常是开发/包管理/缓存，体积巨大但搜索价值低
     vec![
-        "node_modules", ".git", "Library", "Contents/MacOS",
-        ".cache", ".Trash", "target", "__pycache__", ".venv", "venv",
-        ".cargo", ".rustup", ".nvm", ".npm", ".yarn",
-        "miniforge3", "anaconda3", "miniconda3", "conda",
-        ".local/share/Trash", ".docker", ".gradle", ".m2",
-        "Pods", ".build", ".serverless", ".terraform",
-        "vendor/bundle", ".tox", ".eggs", "*.egg-info",
-        "dist", "build", "out", ".next", ".nuxt",
+        "node_modules",
+        ".git",
+        "Library",
+        "Contents/MacOS",
+        ".cache",
+        ".Trash",
+        "target",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".cargo",
+        ".rustup",
+        ".nvm",
+        ".npm",
+        ".yarn",
+        "miniforge3",
+        "anaconda3",
+        "miniconda3",
+        "conda",
+        ".local/share/Trash",
+        ".docker",
+        ".gradle",
+        ".m2",
+        "Pods",
+        ".build",
+        ".serverless",
+        ".terraform",
+        "vendor/bundle",
+        ".tox",
+        ".eggs",
+        "*.egg-info",
+        "dist",
+        "build",
+        "out",
+        ".next",
+        ".nuxt",
     ]
 }
 
@@ -121,19 +152,44 @@ fn fd_exclude_args() -> Vec<&'static str> {
 #[allow(dead_code)]
 fn find_prune_args() -> Vec<String> {
     let dirs = [
-        "node_modules", ".git", "Library", "Contents/MacOS",
-        ".cache", ".Trash", "target", "__pycache__", ".venv", "venv",
-        ".cargo", ".rustup", ".nvm", ".npm", ".yarn",
-        "miniforge3", "anaconda3", "miniconda3",
-        ".docker", ".gradle", ".m2",
-        "Pods", ".build", ".serverless",
-        "vendor", ".tox", ".eggs",
-        "dist", "build", "out", ".next",
+        "node_modules",
+        ".git",
+        "Library",
+        "Contents/MacOS",
+        ".cache",
+        ".Trash",
+        "target",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".cargo",
+        ".rustup",
+        ".nvm",
+        ".npm",
+        ".yarn",
+        "miniforge3",
+        "anaconda3",
+        "miniconda3",
+        ".docker",
+        ".gradle",
+        ".m2",
+        "Pods",
+        ".build",
+        ".serverless",
+        "vendor",
+        ".tox",
+        ".eggs",
+        "dist",
+        "build",
+        "out",
+        ".next",
     ];
     let mut args = Vec::new();
     args.push("(".to_string());
     for (i, d) in dirs.iter().enumerate() {
-        if i > 0 { args.push("-o".to_string()); }
+        if i > 0 {
+            args.push("-o".to_string());
+        }
         args.push("-path".to_string());
         args.push(format!("*/{}/*", d));
     }
@@ -247,8 +303,8 @@ pub struct GlobalIndex {
     pub files: Arc<Mutex<Vec<String>>>,
     pub is_indexing: Arc<Mutex<bool>>,
     pub force_update: Arc<AtomicBool>,
-    pub bm25: Arc<Mutex<Option<String>>>,
-    pub fuzzy: Arc<Mutex<Option<String>>>,
+    pub bm25: Arc<Mutex<Option<Arc<Bm25Index>>>>,
+    pub fuzzy: Arc<Mutex<Option<Arc<FuzzyMatcher>>>>,
     pub thumbnails: Arc<thumbnail::ThumbnailCache>,
 }
 
@@ -374,9 +430,12 @@ impl GlobalIndex {
                 cmd.arg("--hidden")
                     .arg("--follow")
                     .arg("--absolute-path")
-                    .arg("--type").arg("f")
-                    .arg("--type").arg("d")
-                    .arg("--max-depth").arg("20");
+                    .arg("--type")
+                    .arg("f")
+                    .arg("--type")
+                    .arg("d")
+                    .arg("--max-depth")
+                    .arg("20");
                 for excl in fd_exclude_args() {
                     cmd.arg("--exclude").arg(excl);
                 }
@@ -423,17 +482,48 @@ impl GlobalIndex {
             guard.len()
         };
         eprintln!("[sts] 索引构建完成，共 {} 条", count);
+
+        // 增强层：构建 BM25 索引（中文分词）
+        {
+            let files_guard = self.files.lock().unwrap();
+            if let Some(bm25) = Bm25Index::create() {
+                if bm25.rebuild_from_cache(&files_guard).is_ok() {
+                    let mut g = self.bm25.lock().unwrap();
+                    *g = Some(bm25);
+                }
+            }
+        }
+        // 增强层：构建模糊匹配器（别名/缩写/编辑距离）
+        {
+            let files_guard = self.files.lock().unwrap();
+            let fm = FuzzyMatcher::build_from_paths(&files_guard);
+            let mut g = self.fuzzy.lock().unwrap();
+            *g = Some(fm);
+        }
     }
 
     /// 创建后台索引循环 Future（由调用方 spawn 到正确的 runtime）
     /// Tauri GUI 模式：`tauri::async_runtime::spawn(index.start_indexing_loop());`
     /// CLI 模式：`tokio::spawn(index.start_indexing_loop());`
-    pub fn start_indexing_loop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+    pub fn start_indexing_loop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
         let files_clone = self.files.clone();
         let status_clone = self.is_indexing.clone();
         let force_update_clone = self.force_update.clone();
+        let bm25_clone = self.bm25.clone();
+        let fuzzy_clone = self.fuzzy.clone();
 
         Box::pin(async move {
+            // 启动 FSEvents 实时监听：文件变更置位 force_update，由下方循环拾取重建
+            let home0 = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            let watch_paths = vec![
+                format!("{}/Desktop", home0),
+                format!("{}/Downloads", home0),
+                format!("{}/Documents", home0),
+                "/Applications".to_string(),
+            ];
+            fsevents::start_watching(watch_paths, force_update_clone.clone());
             let mut last_volumes = std::collections::HashSet::new();
             let mut last_full_scan = std::time::Instant::now();
 
@@ -446,13 +536,20 @@ impl GlobalIndex {
                 }
 
                 let volumes_changed = current_volumes != last_volumes;
-                let time_to_update = last_full_scan.elapsed() > tokio::time::Duration::from_secs(600);
+                let time_to_update =
+                    last_full_scan.elapsed() > tokio::time::Duration::from_secs(600);
                 let force_now = force_update_clone.load(Ordering::Relaxed);
 
                 if volumes_changed || time_to_update || force_now {
                     eprintln!(
                         "[sts] 开始更新索引 (原因: {})",
-                        if force_now { "手动触发" } else if volumes_changed { "磁盘变化" } else { "定期更新" }
+                        if force_now {
+                            "手动触发"
+                        } else if volumes_changed {
+                            "磁盘变化"
+                        } else {
+                            "定期更新"
+                        }
                     );
 
                     force_update_clone.store(false, Ordering::Relaxed);
@@ -479,13 +576,21 @@ impl GlobalIndex {
                     let use_fd = has_fd();
 
                     for path in &scan_paths {
-                        if !std::path::Path::new(path).exists() { continue; }
+                        if !std::path::Path::new(path).exists() {
+                            continue;
+                        }
 
                         let output = if use_fd {
                             let mut cmd = AsyncCommand::new("fd");
-                            cmd.arg("--hidden").arg("--follow").arg("--absolute-path")
-                                .arg("--type").arg("f").arg("--type").arg("d")
-                                .arg("--max-depth").arg("20");
+                            cmd.arg("--hidden")
+                                .arg("--follow")
+                                .arg("--absolute-path")
+                                .arg("--type")
+                                .arg("f")
+                                .arg("--type")
+                                .arg("d")
+                                .arg("--max-depth")
+                                .arg("20");
                             for excl in fd_exclude_args() {
                                 cmd.arg("--exclude").arg(excl);
                             }
@@ -495,7 +600,8 @@ impl GlobalIndex {
                             AsyncCommand::new("find")
                                 .arg(path)
                                 .args(find_prune_args())
-                                .output().await
+                                .output()
+                                .await
                         };
 
                         if let Ok(out) = output {
@@ -511,18 +617,46 @@ impl GlobalIndex {
 
                     let index_path = get_index_path();
                     if let Ok(mut file) = File::create(&index_path) {
-                        for f in &all_files { let _ = writeln!(file, "{}", f); }
+                        for f in &all_files {
+                            let _ = writeln!(file, "{}", f);
+                        }
                     }
 
                     let count = all_files.len();
-                    { let mut guard = files_clone.lock().unwrap(); *guard = all_files; }
-                    { let mut guard = status_clone.lock().unwrap(); *guard = false; }
+                    {
+                        let mut guard = files_clone.lock().unwrap();
+                        *guard = all_files;
+                    }
+                    {
+                        let mut guard = status_clone.lock().unwrap();
+                        *guard = false;
+                    }
                     eprintln!("[sts] 索引更新完成，共 {} 条", count);
+
+                    // 增强层：重建 BM25 + 模糊匹配（文件列表已变）
+                    {
+                        let files_guard = files_clone.lock().unwrap();
+                        if let Some(bm25) = Bm25Index::create() {
+                            if bm25.rebuild_from_cache(&files_guard).is_ok() {
+                                let mut g = bm25_clone.lock().unwrap();
+                                *g = Some(bm25);
+                            }
+                        }
+                        let fm = FuzzyMatcher::build_from_paths(&files_guard);
+                        let mut g = fuzzy_clone.lock().unwrap();
+                        *g = Some(fm);
+                    }
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             }
         })
+    }
+}
+
+impl Default for GlobalIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -534,73 +668,158 @@ pub fn build_alias_mapping() -> HashMap<String, String> {
     let mut new_map = HashMap::new();
     let aliases = [
         // 设计类
-        ("ps", "photoshop"), ("lr", "lightroom"), ("pr", "premiere"),
-        ("ae", "after effects"), ("ai", "illustrator"), ("id", "indesign"),
-        ("au", "audition"), ("dw", "dreamweaver"), ("an", "animate"),
-        ("pl", "prelude"), ("br", "bridge"), ("ch", "character animator"),
-        ("me", "media encoder"), ("ic", "incopy"), ("fs", "fuse"),
-        ("sc", "scout"), ("st", "stock"), ("xd", "xd"), ("dc", "acrobat"),
-        ("dpp", "digital photo professional"), ("fcpx", "final cut pro"),
-        ("c4d", "cinema 4d"), ("sketch", "sketch"), ("figma", "figma"),
-        ("photoshop", "photoshop"), ("illustrator", "illustrator"),
-        ("premiere", "premiere"), ("aftereffects", "after effects"),
+        ("ps", "photoshop"),
+        ("lr", "lightroom"),
+        ("pr", "premiere"),
+        ("ae", "after effects"),
+        ("ai", "illustrator"),
+        ("id", "indesign"),
+        ("au", "audition"),
+        ("dw", "dreamweaver"),
+        ("an", "animate"),
+        ("pl", "prelude"),
+        ("br", "bridge"),
+        ("ch", "character animator"),
+        ("me", "media encoder"),
+        ("ic", "incopy"),
+        ("fs", "fuse"),
+        ("sc", "scout"),
+        ("st", "stock"),
+        ("xd", "xd"),
+        ("dc", "acrobat"),
+        ("dpp", "digital photo professional"),
+        ("fcpx", "final cut pro"),
+        ("c4d", "cinema 4d"),
+        ("sketch", "sketch"),
+        ("figma", "figma"),
+        ("photoshop", "photoshop"),
+        ("illustrator", "illustrator"),
+        ("premiere", "premiere"),
+        ("aftereffects", "after effects"),
         ("lightroom", "lightroom"),
         // 社交/办公
-        ("wx", "wechat"), ("微信", "wechat"), ("qq", "qq"),
-        ("dd", "dingtalk"), ("钉钉", "dingtalk"), ("fs", "feishu"),
-        ("飞书", "feishu"), ("lark", "feishu"),
-        ("word", "microsoft word"), ("excel", "microsoft excel"),
-        ("ppt", "microsoft powerpoint"), ("wps", "wpsoffice"),
-        ("pdf", "acrobat"), ("obs", "obs studio"), ("yx", "neteasemail"),
-        ("邮箱", "mail"), ("notes", "notes"), ("memo", "notes"),
-        ("wechat", "wechat"), ("dingtalk", "dingtalk"), ("feishu", "feishu"),
+        ("wx", "wechat"),
+        ("微信", "wechat"),
+        ("qq", "qq"),
+        ("dd", "dingtalk"),
+        ("钉钉", "dingtalk"),
+        ("fs", "feishu"),
+        ("飞书", "feishu"),
+        ("lark", "feishu"),
+        ("word", "microsoft word"),
+        ("excel", "microsoft excel"),
+        ("ppt", "microsoft powerpoint"),
+        ("wps", "wpsoffice"),
+        ("pdf", "acrobat"),
+        ("obs", "obs studio"),
+        ("yx", "neteasemail"),
+        ("邮箱", "mail"),
+        ("notes", "notes"),
+        ("memo", "notes"),
+        ("wechat", "wechat"),
+        ("dingtalk", "dingtalk"),
+        ("feishu", "feishu"),
         // 视频/娱乐/AI
-        ("jy", "videofusion"), ("剪映", "videofusion"), ("capcut", "videofusion"),
-        ("vf", "videofusion"), ("db", "doubao"), ("豆包", "doubao"),
-        ("doubao", "doubao"), ("videofusion", "videofusion"),
-        ("db", "douban"), ("dy", "douyin"), ("bili", "bilibili"),
-        ("bz", "bilibili"), ("music", "music"), ("网易云", "neteasemusic"),
-        ("spotify", "spotify"), ("douyin", "douyin"), ("tiktok", "douyin"),
-        ("jianying", "videofusion"), ("jianyingpro", "videofusion"),
+        ("jy", "videofusion"),
+        ("剪映", "videofusion"),
+        ("capcut", "videofusion"),
+        ("vf", "videofusion"),
+        ("db", "doubao"),
+        ("豆包", "doubao"),
+        ("doubao", "doubao"),
+        ("videofusion", "videofusion"),
+        ("db", "douban"),
+        ("dy", "douyin"),
+        ("bili", "bilibili"),
+        ("bz", "bilibili"),
+        ("music", "music"),
+        ("网易云", "neteasemusic"),
+        ("spotify", "spotify"),
+        ("douyin", "douyin"),
+        ("tiktok", "douyin"),
+        ("jianying", "videofusion"),
+        ("jianyingpro", "videofusion"),
         // 生产力
-        ("wp", "wpsoffice"), ("wps", "wpsoffice"),
-        ("pages", "pages"), ("numbers", "numbers"), ("keynote", "keynote"),
+        ("wp", "wpsoffice"),
+        ("wps", "wpsoffice"),
+        ("pages", "pages"),
+        ("numbers", "numbers"),
+        ("keynote", "keynote"),
         // 工具/开发
-        ("llq", "browser"), ("浏览器", "browser"), ("safari", "safari"),
-        ("chrome", "google chrome"), ("edge", "microsoft edge"),
-        ("fd", "finder"), ("访达", "finder"), ("zd", "terminal"),
-        ("终端", "terminal"), ("iterm", "iterm"),
-        ("code", "visual studio code"), ("vs", "visual studio code"),
-        ("vscode", "visual studio code"), ("st", "sublime text"),
-        ("idea", "intellij idea"), ("webstorm", "webstorm"),
-        ("py", "pycharm"), ("git", "github"), ("postman", "postman"),
+        ("llq", "browser"),
+        ("浏览器", "browser"),
+        ("safari", "safari"),
+        ("chrome", "google chrome"),
+        ("edge", "microsoft edge"),
+        ("fd", "finder"),
+        ("访达", "finder"),
+        ("zd", "terminal"),
+        ("终端", "terminal"),
+        ("iterm", "iterm"),
+        ("code", "visual studio code"),
+        ("vs", "visual studio code"),
+        ("vscode", "visual studio code"),
+        ("st", "sublime text"),
+        ("idea", "intellij idea"),
+        ("webstorm", "webstorm"),
+        ("py", "pycharm"),
+        ("git", "github"),
+        ("postman", "postman"),
         ("docker", "docker"),
         // 系统/其他
-        ("sz", "settings"), ("设置", "settings"), ("jh", "calculator"),
-        ("计算器", "calculator"), ("activity", "activity monitor"),
-        ("monitor", "activity monitor"), ("disk", "disk utility"),
-        ("keychain", "keychain access"), ("console", "console"),
+        ("sz", "settings"),
+        ("设置", "settings"),
+        ("jh", "calculator"),
+        ("计算器", "calculator"),
+        ("activity", "activity monitor"),
+        ("monitor", "activity monitor"),
+        ("disk", "disk utility"),
+        ("keychain", "keychain access"),
+        ("console", "console"),
         // 通讯/会议
-        ("tg", "telegram"), ("telegram", "telegram"), ("dc", "discord"),
-        ("discord", "discord"), ("slack", "slack"), ("zoom", "zoom.us"),
-        ("会议", "zoom.us"), ("腾讯会议", "tencent meeting"),
-        ("firefox", "firefox"), ("ff", "firefox"), ("brave", "brave browser"),
-        ("arc", "arc"), ("opera", "opera"),
+        ("tg", "telegram"),
+        ("telegram", "telegram"),
+        ("dc", "discord"),
+        ("discord", "discord"),
+        ("slack", "slack"),
+        ("zoom", "zoom.us"),
+        ("会议", "zoom.us"),
+        ("腾讯会议", "tencent meeting"),
+        ("firefox", "firefox"),
+        ("ff", "firefox"),
+        ("brave", "brave browser"),
+        ("arc", "arc"),
+        ("opera", "opera"),
         // AI/开发工具
-        ("cursor", "cursor"), ("windsurf", "windsurf"), ("claude", "claude"),
-        ("warp", "warp"), ("vim", "vim"), ("nvim", "neovide"),
-        ("blender", "blender"), ("unity", "unity hub"),
-        ("chatgpt", "chatgpt"), ("gpt", "chatgpt"), ("ollama", "ollama"),
+        ("cursor", "cursor"),
+        ("windsurf", "windsurf"),
+        ("claude", "claude"),
+        ("warp", "warp"),
+        ("vim", "vim"),
+        ("nvim", "neovide"),
+        ("blender", "blender"),
+        ("unity", "unity hub"),
+        ("chatgpt", "chatgpt"),
+        ("gpt", "chatgpt"),
+        ("ollama", "ollama"),
         // 娱乐/下载
-        ("netease", "neteasemusic"), ("spotify", "spotify"),
-        ("百度网盘", "baidunetdisk"), ("百度云", "baidunetdisk"),
-        ("迅雷", "thunder"), ("qb", "qbittorrent"),
+        ("netease", "neteasemusic"),
+        ("spotify", "spotify"),
+        ("百度网盘", "baidunetdisk"),
+        ("百度云", "baidunetdisk"),
+        ("迅雷", "thunder"),
+        ("qb", "qbittorrent"),
         // 系统工具
-        ("预览", "preview"), ("图书", "books"),
-        ("font", "font book"), ("字体册", "font book"),
-        ("截图", "screenshot"), ("录屏", "quicktime player"),
-        ("备忘录", "notes"), ("提醒事项", "reminders"),
-        ("地图", "maps"), ("通讯录", "contacts"),
+        ("预览", "preview"),
+        ("图书", "books"),
+        ("font", "font book"),
+        ("字体册", "font book"),
+        ("截图", "screenshot"),
+        ("录屏", "quicktime player"),
+        ("备忘录", "notes"),
+        ("提醒事项", "reminders"),
+        ("地图", "maps"),
+        ("通讯录", "contacts"),
         ("日历", "calendar"),
     ];
 
@@ -618,24 +837,26 @@ pub fn build_alias_mapping() -> HashMap<String, String> {
     };
     for app_dir in &app_dirs {
         if let Ok(entries) = std::fs::read_dir(app_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".app") {
-                let base_name = name.replace(".app", "").to_lowercase();
-                new_map.entry(base_name.clone()).or_insert(base_name.clone());
-                if base_name.contains(' ') || base_name.contains('-') {
-                    let short: String = base_name
-                        .split([' ', '-'])
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.chars().next().unwrap_or(' '))
-                        .collect();
-                    if short.len() > 1 {
-                        new_map.entry(short).or_insert(base_name.clone());
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".app") {
+                    let base_name = name.replace(".app", "").to_lowercase();
+                    new_map
+                        .entry(base_name.clone())
+                        .or_insert(base_name.clone());
+                    if base_name.contains(' ') || base_name.contains('-') {
+                        let short: String = base_name
+                            .split([' ', '-'])
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.chars().next().unwrap_or(' '))
+                            .collect();
+                        if short.len() > 1 {
+                            new_map.entry(short).or_insert(base_name.clone());
+                        }
                     }
                 }
             }
         }
-    }
     }
 
     new_map
@@ -646,7 +867,11 @@ pub fn build_alias_mapping() -> HashMap<String, String> {
 // ============================================================
 
 /// Spotlight 文件名搜索（并行搜索用户目录 + 外接盘）
-async fn spotlight_search(keyword_lc: &str, filter_type: &str, mapping: &HashMap<String, String>) -> Vec<InternalSearchResult> {
+async fn spotlight_search(
+    keyword_lc: &str,
+    filter_type: &str,
+    mapping: &HashMap<String, String>,
+) -> Vec<InternalSearchResult> {
     let strategy = SearchStrategy::from_type(filter_type);
     let mapped_keyword = mapping.get(keyword_lc).cloned();
     let words: Vec<&str> = keyword_lc.split_whitespace().collect();
@@ -661,11 +886,14 @@ async fn spotlight_search(keyword_lc: &str, filter_type: &str, mapping: &HashMap
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             AsyncCommand::new("mdfind")
-                .arg("-onlyin").arg(&home)
-                .arg("-onlyin").arg("/Applications")
+                .arg("-onlyin")
+                .arg(&home)
+                .arg("-onlyin")
+                .arg("/Applications")
                 .arg(&q1)
                 .output(),
-        ).await;
+        )
+        .await;
         match output {
             Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).to_string(),
             _ => String::new(),
@@ -678,10 +906,12 @@ async fn spotlight_search(keyword_lc: &str, filter_type: &str, mapping: &HashMap
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(4),
             AsyncCommand::new("mdfind")
-                .arg("-onlyin").arg("/Volumes")
+                .arg("-onlyin")
+                .arg("/Volumes")
                 .arg(&q_vol)
                 .output(),
-        ).await;
+        )
+        .await;
         match output {
             Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).to_string(),
             _ => String::new(),
@@ -698,7 +928,12 @@ async fn spotlight_search(keyword_lc: &str, filter_type: &str, mapping: &HashMap
                 continue;
             }
             let name = path.split('/').next_back().unwrap_or(&path).to_string();
-            results.push(InternalSearchResult { path, name, score: 0, source: "spotlight".to_string() });
+            results.push(InternalSearchResult {
+                path,
+                name,
+                score: 0,
+                source: "spotlight".to_string(),
+            });
         }
     }
     results
@@ -746,9 +981,11 @@ async fn rg_index_search(
             // rg 搜索缓存文件，-i 忽略大小写，--max-count 限制每词最多匹配
             AsyncCommand::new("rg")
                 .arg("-i")
-                .arg("--max-count").arg("300")
+                .arg("--max-count")
+                .arg("300")
                 .arg("--no-filename")
-                .arg("--color").arg("never")
+                .arg("--color")
+                .arg("never")
                 .arg(term)
                 .arg(&index_path)
                 .output()
@@ -757,7 +994,8 @@ async fn rg_index_search(
             // 回退到 grep
             AsyncCommand::new("grep")
                 .arg("-i")
-                .arg("-m").arg("300")
+                .arg("-m")
+                .arg("300")
                 .arg(term)
                 .arg(&index_path)
                 .output()
@@ -765,20 +1003,28 @@ async fn rg_index_search(
         };
 
         if let Ok(out) = output {
-            if !out.status.success() { continue; }
+            if !out.status.success() {
+                continue;
+            }
             let content = String::from_utf8_lossy(&out.stdout);
             for line in content.lines() {
                 let path = line.trim().to_string();
-                if path.is_empty() { continue; }
+                if path.is_empty() {
+                    continue;
+                }
 
                 // 去重（用 HashSet 替代 Vec::iter().any，O(1) vs O(n)）
-                if !seen_paths.insert(path.clone()) { continue; }
+                if !seen_paths.insert(path.clone()) {
+                    continue;
+                }
 
                 // 过滤类型
                 if filter_type != "all" {
                     if filter_type == "folder" {
                         let is_likely_dir = !path.contains('.') || path.ends_with(".app");
-                        if !is_likely_dir { continue; }
+                        if !is_likely_dir {
+                            continue;
+                        }
                     } else if !strategy.matches_extension(&path) {
                         continue;
                     }
@@ -796,14 +1042,18 @@ async fn rg_index_search(
                 let score = if is_name_match { 100 } else { 50 };
 
                 all_results.push(InternalSearchResult {
-                    path, name, score,
+                    path,
+                    name,
+                    score,
                     source: if use_rg { "rg" } else { "grep" }.to_string(),
                 });
             }
         }
 
         // 找够结果就不搜更多词了
-        if all_results.len() >= 300 { break; }
+        if all_results.len() >= 300 {
+            break;
+        }
     }
 
     all_results
@@ -824,7 +1074,10 @@ fn memory_index_search(
 
     let volumes_exist: std::collections::HashSet<String> =
         if let Ok(entries) = std::fs::read_dir("/Volumes") {
-            entries.flatten().map(|e| e.path().to_string_lossy().to_string()).collect()
+            entries
+                .flatten()
+                .map(|e| e.path().to_string_lossy().to_string())
+                .collect()
         } else {
             std::collections::HashSet::new()
         };
@@ -833,12 +1086,16 @@ fn memory_index_search(
     let max_results = 200;
 
     for path in index_files.iter() {
-        if results.len() >= max_results { break; }
+        if results.len() >= max_results {
+            break;
+        }
 
         if filter_type != "all" {
             if filter_type == "folder" {
                 let is_likely_dir = !path.contains('.') || path.ends_with(".app");
-                if !is_likely_dir { continue; }
+                if !is_likely_dir {
+                    continue;
+                }
             } else if !strategy.matches_extension(path) {
                 continue;
             }
@@ -848,7 +1105,9 @@ fn memory_index_search(
             let parts: Vec<&str> = path.split('/').collect();
             if parts.len() >= 3 {
                 let vol_path = format!("/Volumes/{}", parts[2]);
-                if !volumes_exist.contains(&vol_path) { continue; }
+                if !volumes_exist.contains(&vol_path) {
+                    continue;
+                }
             }
         }
 
@@ -871,7 +1130,9 @@ fn memory_index_search(
 
         if matched_count < words.len() {
             if let Some(en_name) = mapped_keyword.as_ref() {
-                if name_lc.contains(en_name.to_lowercase().as_str()) { matched_count = words.len(); }
+                if name_lc.contains(en_name.to_lowercase().as_str()) {
+                    matched_count = words.len();
+                }
             }
             if matched_count < words.len() && keyword_lc.len() >= 2 {
                 let initials: String = name_lc
@@ -879,18 +1140,26 @@ fn memory_index_search(
                     .filter(|s| !s.is_empty())
                     .map(|s| s.chars().next().unwrap_or(' '))
                     .collect();
-                if initials.contains(keyword_lc) { matched_count = words.len(); }
+                if initials.contains(keyword_lc) {
+                    matched_count = words.len();
+                }
             }
         }
 
         if matched_count == words.len() {
             let score = if name_only_match { 100 } else { 50 };
             results.push(InternalSearchResult {
-                path: path.clone(), name, score, source: "memory".to_string(),
+                path: path.clone(),
+                name,
+                score,
+                source: "memory".to_string(),
             });
         } else if matched_count > 0 && words.len() > 1 {
             fallback_results.push(InternalSearchResult {
-                path: path.clone(), name, score: 0, source: "memory".to_string(),
+                path: path.clone(),
+                name,
+                score: 0,
+                source: "memory".to_string(),
             });
         }
     }
@@ -902,6 +1171,12 @@ fn memory_index_search(
     results
 }
 
+/// 判断是否为系统垃圾文件：`.` 开头隐藏文件（.DS_Store/.git/.config 等）
+/// 与 `._` 开头 AppleDouble 资源分叉。人类模式永不进结果集。
+fn is_system_cruft(name: &str, _path: &str) -> bool {
+    name.starts_with('.')
+}
+
 /// 排序与去重
 fn sort_and_dedup(
     results: Vec<InternalSearchResult>,
@@ -909,12 +1184,18 @@ fn sort_and_dedup(
     filter_type: &str,
     click_history: &HashMap<String, u32>,
     mapping: &HashMap<String, String>,
+    human_mode: bool,
 ) -> Vec<SearchResult> {
     let mapped_keyword = mapping.get(keyword_lc).cloned();
     let mut all_results = results;
 
     let mut seen = HashSet::new();
     all_results.retain(|r| seen.insert(r.path.clone()));
+
+    // 人类模式：硬过滤系统垃圾（. 开头隐藏文件 / ._ AppleDouble）
+    if human_mode {
+        all_results.retain(|r| !is_system_cruft(&r.name, &r.path));
+    }
 
     // 收集来源信息
     let sources: HashSet<String> = all_results.iter().map(|r| r.source.clone()).collect();
@@ -967,7 +1248,9 @@ fn sort_and_dedup(
                 }
                 if is_continuous {
                     base_score += 10000;
-                    if name_lc.starts_with(words[0]) { base_score += 5000; }
+                    if name_lc.starts_with(words[0]) {
+                        base_score += 5000;
+                    }
                 } else {
                     base_score += 5000;
                 }
@@ -985,22 +1268,67 @@ fn sort_and_dedup(
         }
 
         let depth = res.path.split('/').count() as i32;
-        if res.path.contains(".app/Contents/") { base_score -= 10000; }
-        if !res.path.starts_with("/Applications") { base_score -= depth * 50; }
-        if res.path.starts_with("/Applications") { base_score += 5000; }
-        else if res.path.contains("/Desktop") { base_score += 1000; }
+        if res.path.contains(".app/Contents/") {
+            base_score -= 10000;
+        }
+        if !res.path.starts_with("/Applications") {
+            base_score -= depth * 50;
+        }
+        if res.path.starts_with("/Applications") {
+            base_score += 5000;
+        } else if res.path.contains("/Desktop") {
+            base_score += 1000;
+        }
 
         // 颜色配置文件降级：3dl/icc/csp/cube 等色彩查找表格式排后
-        if let Some(ext) = res.path.rsplit('.').last().map(|e| e.to_lowercase()) {
-            let color_exts = ["3dl", "icc", "csp", "cube", "lut", "dcp", "mga", "hdr", "exr"];
+        if let Some(ext) = res.path.rsplit('.').next_back().map(|e| e.to_lowercase()) {
+            let color_exts = [
+                "3dl", "icc", "csp", "cube", "lut", "dcp", "mga", "hdr", "exr",
+            ];
             if color_exts.contains(&ext.as_str()) {
                 base_score -= 8000;
             }
             if filter_type == "image" {
-                let img_priority = ["jpg", "jpeg", "png", "heic", "heif", "raw", "arw", "cr2", "nef", "dng", "tiff", "tif", "webp", "gif", "bmp", "psd", "svg"];
+                let img_priority = [
+                    "jpg", "jpeg", "png", "heic", "heif", "raw", "arw", "cr2", "nef", "dng",
+                    "tiff", "tif", "webp", "gif", "bmp", "psd", "svg",
+                ];
                 if img_priority.contains(&ext.as_str()) {
                     base_score += 3000;
                 }
+            }
+        }
+
+        // 人类模式：代码/程序目录与代码类型排名降级（不隐藏，豁免精确/别名命中）
+        if human_mode {
+            let code_dirs = [
+                "node_modules",
+                ".git",
+                "target",
+                "build",
+                "dist",
+                "DerivedData",
+                "usr",
+                "System",
+                "opt/homebrew",
+                ".cargo",
+                "Library/Caches",
+            ];
+            if code_dirs.iter().any(|d| res.path.contains(d)) {
+                base_score -= 8000;
+            }
+            if let Some(ext) = res.path.rsplit('.').next_back() {
+                let code_exts = [
+                    "rs", "py", "js", "ts", "tsx", "go", "c", "h", "cpp", "java", "rb", "sh",
+                    "toml", "json", "lock", "yaml", "yml",
+                ];
+                if code_exts.contains(&ext.to_lowercase().as_str()) {
+                    base_score -= 5000;
+                }
+            }
+            // 豁免：精确命中文件名或别名/缩写命中时不降级
+            if name_lc == keyword_lc || is_alias_match || is_acronym_match {
+                base_score += 13000;
             }
         }
 
@@ -1009,21 +1337,23 @@ fn sort_and_dedup(
 
     all_results.sort_by(|a, b| b.score.cmp(&a.score));
 
-    all_results.into_iter().take(100).map(|r| SearchResult {
-        path: r.path,
-        name: r.name,
-        score: if r.score != 0 { Some(r.score) } else { None },
-        elapsed_ms: None, // 由调用方填充
-        source: Some(source_str.clone()),
-    }).collect()
+    let take_n = if human_mode { 100 } else { 500 };
+    all_results
+        .into_iter()
+        .take(take_n)
+        .map(|r| SearchResult {
+            path: r.path,
+            name: r.name,
+            score: if r.score != 0 { Some(r.score) } else { None },
+            elapsed_ms: None, // 由调用方填充
+            source: Some(source_str.clone()),
+        })
+        .collect()
 }
 
 /// 获取最近文件（搜索框空时使用）
 /// 用 mdfind 按 Spotlight 排序取 Desktop/Downloads/Documents 中的最近文件，毫秒级
-pub async fn recent_files(
-    filter_type: &str,
-    max_results: usize,
-) -> Vec<SearchResult> {
+pub async fn recent_files(filter_type: &str, max_results: usize) -> Vec<SearchResult> {
     let start = std::time::Instant::now();
     let kind_query = match filter_type {
         "image" => "kMDItemContentTypeTree == 'public.image'",
@@ -1047,10 +1377,7 @@ pub async fn recent_files(
         cmd.arg("-onlyin").arg("/Applications");
     }
     cmd.arg(&query);
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        cmd.output(),
-    ).await;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output()).await;
     let mut results = Vec::new();
     if let Ok(Ok(o)) = output {
         for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -1059,17 +1386,29 @@ pub async fn recent_files(
                 continue;
             }
             let name = path.split('/').next_back().unwrap_or(&path).to_string();
-            if name.starts_with('.') || name.starts_with("._") { continue; }
+            if name.starts_with('.') || name.starts_with("._") {
+                continue;
+            }
             results.push(SearchResult {
-                path, name, score: Some(0),
-                elapsed_ms: None, source: Some("spotlight".to_string()),
+                path,
+                name,
+                score: Some(0),
+                elapsed_ms: None,
+                source: Some("spotlight".to_string()),
             });
-            if results.len() >= max_results { break; }
+            if results.len() >= max_results {
+                break;
+            }
         }
     }
     let elapsed = start.elapsed().as_millis();
     if elapsed > 50 {
-        eprintln!("[sts] 最近文件: {}ms, {} 条 (filter={})", elapsed, results.len(), filter_type);
+        eprintln!(
+            "[sts] 最近文件: {}ms, {} 条 (filter={})",
+            elapsed,
+            results.len(),
+            filter_type
+        );
     }
     results
 }
@@ -1095,20 +1434,47 @@ pub async fn search_files(
     let cache_exists = get_index_path().exists();
     let rg_ok = has_rg();
 
-    let all_results = if cache_exists && (rg_ok || which_grep()) {
-        // 主路径：rg/grep 搜索引缓存 + mdfind 并行
-        let (rg_res, spotlight_res) = tokio::join!(
-            rg_index_search(&keyword_lc, filter_type, mapping),
-            spotlight_search(&keyword_lc, filter_type, mapping),
-        );
-        [rg_res, spotlight_res].concat()
-    } else {
-        // 回退路径：只用 mdfind（无缓存时的兜底）
-        eprintln!("[sts] 索引缓存不存在，仅使用 Spotlight 搜索");
-        spotlight_search(&keyword_lc, filter_type, mapping).await
+    // 模糊扩展查询词（别名/缩写/编辑距离/前缀），扩展召回
+    let expanded: Vec<String> = {
+        let g = _index.fuzzy.lock().unwrap();
+        match &*g {
+            Some(fm) => fm.expand_query(&keyword_lc),
+            None => vec![keyword_lc.clone()],
+        }
     };
 
-    let mut results = sort_and_dedup(all_results, &keyword_lc, filter_type, click_history, mapping);
+    let mut all_results: Vec<InternalSearchResult> = Vec::new();
+    for kw in &expanded {
+        if cache_exists && (rg_ok || which_grep()) {
+            let (rg_res, spotlight_res) = tokio::join!(
+                rg_index_search(kw, filter_type, mapping),
+                spotlight_search(kw, filter_type, mapping),
+            );
+            all_results.extend(rg_res);
+            all_results.extend(spotlight_res);
+        } else {
+            eprintln!("[sts] 索引缓存不存在，仅使用 Spotlight 搜索");
+            all_results.extend(spotlight_search(kw, filter_type, mapping).await);
+        }
+    }
+
+    // BM25 增强层（中文分词匹配，直接搜原词）
+    {
+        let g = _index.bm25.lock().unwrap();
+        if let Some(bm25) = &*g {
+            let bm25_res = bm25.search(&keyword_lc, filter_type, 50);
+            all_results.extend(bm25_res);
+        }
+    }
+
+    let mut results = sort_and_dedup(
+        all_results,
+        &keyword_lc,
+        filter_type,
+        click_history,
+        mapping,
+        _human_mode,
+    );
 
     // 智能计时：仅慢查询（>100ms）才标注耗时
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1133,7 +1499,9 @@ fn which_grep() -> bool {
 /// 内容搜索入口（rg / grep）
 /// 默认搜索 Desktop/Documents/Downloads（避免全 HOME 目录慢搜）
 /// 5 秒超时保护，防止在巨大目录上卡死
-pub async fn search_content(params: ContentSearchParams) -> Result<Vec<ContentSearchResult>, String> {
+pub async fn search_content(
+    params: ContentSearchParams,
+) -> Result<Vec<ContentSearchResult>, String> {
     let keyword = params.keyword.trim().to_string();
     if keyword.is_empty() {
         return Ok(Vec::new());
@@ -1143,10 +1511,7 @@ pub async fn search_content(params: ContentSearchParams) -> Result<Vec<ContentSe
     // 用户可通过 -p 指定特定目录搜索
     let search_path = if params.path.is_empty() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        vec![
-            format!("{}/Desktop", home),
-            format!("{}/Downloads", home),
-        ]
+        vec![format!("{}/Desktop", home), format!("{}/Downloads", home)]
     } else {
         vec![params.path.clone()]
     };
@@ -1178,33 +1543,57 @@ pub async fn search_content(params: ContentSearchParams) -> Result<Vec<ContentSe
                 cmd.arg("--line-number")
                     .arg("--no-heading")
                     .arg("--with-filename")
-                    .arg("--color").arg("never")
-                    .arg("--max-count").arg("10")
-                    .arg("--max-depth").arg("20")
+                    .arg("--color")
+                    .arg("never")
+                    .arg("--max-count")
+                    .arg("10")
+                    .arg("--max-depth")
+                    .arg("20")
                     .arg("--hidden")
                     .arg("--follow")
                     // 逐个排除目录（rg 不支持花括号展开）
-                    .arg("--glob").arg("!.git")
-                    .arg("--glob").arg("!node_modules")
-                    .arg("--glob").arg("!Library")
-                    .arg("--glob").arg("!Contents/MacOS")
-                    .arg("--glob").arg("!*.app/Contents")
-                    .arg("--glob").arg("!.cache")
-                    .arg("--glob").arg("!.Trash")
-                    .arg("--glob").arg("!target")
-                    .arg("--glob").arg("!__pycache__")
-                    .arg("--glob").arg("!*.pyc")
-                    .arg("--glob").arg("!.venv")
-                    .arg("--glob").arg("!venv")
-                    .arg("--glob").arg("!.cargo")
-                    .arg("--glob").arg("!.rustup")
-                    .arg("--glob").arg("!.nvm")
-                    .arg("--glob").arg("!miniforge3")
-                    .arg("--glob").arg("!anaconda3")
-                    .arg("--glob").arg("!*.min.js")
-                    .arg("--glob").arg("!*.min.css")
-                    .arg("--glob").arg("!*.map")
-                    .arg("--encoding").arg("auto");
+                    .arg("--glob")
+                    .arg("!.git")
+                    .arg("--glob")
+                    .arg("!node_modules")
+                    .arg("--glob")
+                    .arg("!Library")
+                    .arg("--glob")
+                    .arg("!Contents/MacOS")
+                    .arg("--glob")
+                    .arg("!*.app/Contents")
+                    .arg("--glob")
+                    .arg("!.cache")
+                    .arg("--glob")
+                    .arg("!.Trash")
+                    .arg("--glob")
+                    .arg("!target")
+                    .arg("--glob")
+                    .arg("!__pycache__")
+                    .arg("--glob")
+                    .arg("!*.pyc")
+                    .arg("--glob")
+                    .arg("!.venv")
+                    .arg("--glob")
+                    .arg("!venv")
+                    .arg("--glob")
+                    .arg("!.cargo")
+                    .arg("--glob")
+                    .arg("!.rustup")
+                    .arg("--glob")
+                    .arg("!.nvm")
+                    .arg("--glob")
+                    .arg("!miniforge3")
+                    .arg("--glob")
+                    .arg("!anaconda3")
+                    .arg("--glob")
+                    .arg("!*.min.js")
+                    .arg("--glob")
+                    .arg("!*.min.css")
+                    .arg("--glob")
+                    .arg("!*.map")
+                    .arg("--encoding")
+                    .arg("auto");
 
                 if !filter_type_clone.is_empty() && filter_type_clone != "all" {
                     let strategy = SearchStrategy::from_type(&filter_type_clone);
@@ -1232,8 +1621,11 @@ pub async fn search_content(params: ContentSearchParams) -> Result<Vec<ContentSe
                 if !filter_type_clone.is_empty() && filter_type_clone != "all" {
                     let strategy = SearchStrategy::from_type(&filter_type_clone);
                     if !strategy.extensions.is_empty() {
-                        let include_patterns: Vec<String> =
-                            strategy.extensions.iter().map(|e| format!("*{}", e)).collect();
+                        let include_patterns: Vec<String> = strategy
+                            .extensions
+                            .iter()
+                            .map(|e| format!("*{}", e))
+                            .collect();
                         cmd.arg("--include").arg(include_patterns.join(","));
                     }
                 }
@@ -1274,7 +1666,9 @@ pub async fn search_content(params: ContentSearchParams) -> Result<Vec<ContentSe
         };
 
         for line in content.lines() {
-            if results.len() >= max_results { break; }
+            if results.len() >= max_results {
+                break;
+            }
 
             let parts: Vec<&str> = line.splitn(3, ':').collect();
             if parts.len() >= 3 {
@@ -1282,12 +1676,20 @@ pub async fn search_content(params: ContentSearchParams) -> Result<Vec<ContentSe
                 let line_number = parts[1].parse::<u64>().unwrap_or(0);
                 let line_content = parts[2].trim().to_string();
 
-                if path.contains("/Contents/MacOS/") || path.contains("/Library/") || path.contains("/.git/") {
+                if path.contains("/Contents/MacOS/")
+                    || path.contains("/Library/")
+                    || path.contains("/.git/")
+                {
                     continue;
                 }
 
                 let name = path.split('/').next_back().unwrap_or(&path).to_string();
-                results.push(ContentSearchResult { path, name, line_number, line_content });
+                results.push(ContentSearchResult {
+                    path,
+                    name,
+                    line_number,
+                    line_content,
+                });
             }
         }
     }
