@@ -11,9 +11,7 @@ use tauri_plugin_cli::CliExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 use tokio::time::{sleep, Duration};
 
-use sts_core::{build_alias_mapping, ContentSearchParams, GlobalIndex};
-
-mod mcp;
+use sts_core::{GlobalIndex, ContentSearchParams, build_alias_mapping};
 
 // Tauri 前端用的搜索结果结构（保持 API 兼容）
 #[derive(Serialize, Clone)]
@@ -60,8 +58,6 @@ struct AppCache {
     mapping: Arc<Mutex<HashMap<String, String>>>,
     click_history: Arc<Mutex<HashMap<String, u32>>>,
     index: GlobalIndex,
-    /// MCP 服务实际绑定端口（None=未启动/占用失败），供 GUI 状态栏显示
-    mcp_port: Arc<Mutex<Option<u16>>>,
 }
 
 impl AppCache {
@@ -70,13 +66,8 @@ impl AppCache {
             mapping: Arc::new(Mutex::new(build_alias_mapping())),
             click_history: Arc::new(Mutex::new(HashMap::new())),
             index: GlobalIndex::new(),
-            mcp_port: Arc::new(Mutex::new(None)),
         };
         cache.load_click_history();
-        // 启动即构建 BM25 语义索引 + 模糊匹配器（若已有缓存立即可用；无缓存由后台循环补充）
-        // BM25 + 模糊匹配器暂禁用（需 tantivy 库，当前环境版本不兼容）
-        // cache.index.rebuild_bm25();
-        // cache.index.rebuild_fuzzy();
         cache
     }
 
@@ -126,24 +117,11 @@ async fn search_files(
     _app: AppHandle,
 ) -> Result<Vec<SearchResult>, String> {
     let keyword_lc = keyword.to_lowercase();
-
-    // 空关键词时返回最近文件（按修改日期倒序）
     if keyword_lc.trim().is_empty() {
-        let results = sts_core::recent_files(&filter_type, 50).await;
-        let converted: Vec<SearchResult> = results.into_iter().map(|r| SearchResult {
-            path: r.path,
-            name: r.name,
-            score: r.score.unwrap_or(0),
-            elapsed_ms: r.elapsed_ms,
-            source: r.source,
-        }).collect();
-        return Ok(converted);
+        return Ok(Vec::new());
     }
 
-    println!(
-        "收到极速搜索请求: keyword='{}', type='{}'",
-        keyword, filter_type
-    );
+    println!("收到极速搜索请求: keyword='{}', type='{}'", keyword, filter_type);
 
     let click_history = state.click_history.lock().unwrap().clone();
     let mapping = state.mapping.lock().unwrap().clone();
@@ -154,7 +132,6 @@ async fn search_files(
         &state.index,
         &click_history,
         &mapping,
-        true, // 人类 GUI 模式：过滤系统垃圾 + 代码降级
     )
     .await;
 
@@ -171,22 +148,6 @@ async fn search_files(
         .collect();
 
     Ok(final_results)
-}
-
-#[tauri::command]
-async fn get_thumbnail(
-    path: String,
-    size: Option<u32>,
-    state: State<'_, AppCache>,
-) -> Result<Option<String>, String> {
-    let index = state.index.clone();
-    // qlmanage 是阻塞的 IO/进程调用，放到阻塞线程池，避免卡住异步 runtime
-    let uri = tauri::async_runtime::spawn_blocking(move || {
-        index.get_thumbnail(&path, size.unwrap_or(128))
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(uri)
 }
 
 #[tauri::command]
@@ -278,9 +239,7 @@ async fn copy_to_clipboard(path: String) -> Result<(), String> {
             let mut child = Command::new("pbcopy").spawn().map_err(|e| e.to_string())?;
             if let Some(mut stdin) = child.stdin.take() {
                 use std::io::Write;
-                stdin
-                    .write_all(path.as_bytes())
-                    .map_err(|e| e.to_string())?;
+                stdin.write_all(path.as_bytes()).map_err(|e| e.to_string())?;
             }
             child.wait().map_err(|e| e.to_string())?;
             Ok(())
@@ -301,11 +260,6 @@ fn record_click(path: String, state: State<'_, AppCache>) -> Result<(), String> 
 fn trigger_index_update(state: State<'_, AppCache>) -> Result<(), String> {
     state.index.force_update.store(true, Ordering::Relaxed);
     Ok(())
-}
-
-#[tauri::command]
-fn get_mcp_port(state: State<'_, AppCache>) -> Option<u16> {
-    *state.mcp_port.lock().unwrap()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -363,12 +317,7 @@ pub fn run() {
 
                         tauri::async_runtime::spawn(async move {
                             let results = sts_core::search_files(
-                                &query,
-                                &filter_type,
-                                &index,
-                                &click_history,
-                                &mapping,
-                                true,
+                                &query, &filter_type, &index, &click_history, &mapping,
                             )
                             .await;
 
@@ -394,29 +343,21 @@ pub fn run() {
 
             let window = app.get_webview_window("main").unwrap();
             let window_clone = window.clone();
-            window.on_window_event(move |event| match event {
-                tauri::WindowEvent::Focused(false) => {
-                    let _ = window_clone.hide();
+            window.on_window_event(move |event| {
+                match event {
+                    tauri::WindowEvent::Focused(false) => {
+                        let _ = window_clone.hide();
+                    }
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        let _ = window_clone.hide();
+                        api.prevent_close();
+                    }
+                    _ => {}
                 }
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    let _ = window_clone.hide();
-                    api.prevent_close();
-                }
-                _ => {}
             });
 
             // 启动后台索引任务（使用 Tauri 的 async runtime，而非裸 tokio::spawn）
             tauri::async_runtime::spawn(cache_clone.index.start_indexing_loop());
-
-            // 启动 MCP 服务（给 AI/Agent 用；端口冲突自愈，实际端口回传 GUI 状态栏）
-            {
-                let port = mcp::start(cache_clone.index.clone(), cache_clone.mapping.clone());
-                if let Some(p) = port {
-                    eprintln!("[sts] MCP 已启动: http://127.0.0.1:{}/tools", p);
-                }
-                let state = app.state::<AppCache>();
-                *state.mcp_port.lock().unwrap() = port;
-            }
 
             // 后台映射更新任务
             let cache_for_update = cache_clone.clone();
@@ -436,9 +377,7 @@ pub fn run() {
             record_click,
             get_indexing_status,
             trigger_index_update,
-            copy_to_clipboard,
-            get_thumbnail,
-            get_mcp_port
+            copy_to_clipboard
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
