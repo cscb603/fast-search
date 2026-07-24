@@ -311,6 +311,22 @@ fn get_mcp_port(state: State<'_, AppCache>) -> Option<u16> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // GUI 应用经 launchd 拉起时 PATH 极窄（仅 /usr/bin:/bin:/usr/sbin:/sbin），
+    // 导致 fd / rg 等 Homebrew 工具找不到，索引回退到慢速 find、搜索回退到 grep。
+    // 这里把常见 Homebrew / 系统 bin 目录补进 PATH，保证快速搜索链路可用。
+    if let Ok(current) = std::env::var("PATH") {
+        let extra = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+        let mut parts: Vec<&str> = current.split(':').collect();
+        for e in extra.iter() {
+            if !parts.contains(e) {
+                parts.push(e);
+            }
+        }
+        let new_path = parts.join(":");
+        let _ = std::env::set_var("PATH", new_path);
+        eprintln!("[sts] PATH 已补齐: {}", new_path);
+    }
+
     let app_cache = AppCache::new();
     let cache_clone = app_cache.clone();
 

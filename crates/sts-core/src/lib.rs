@@ -64,7 +64,7 @@ fn default_max_content_results() -> usize {
 }
 
 // 内部搜索结果（含 score，不序列化）
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct InternalSearchResult {
     pub path: String,
     pub name: String,
@@ -524,6 +524,9 @@ impl GlobalIndex {
                 "/Applications".to_string(),
             ];
             fsevents::start_watching(watch_paths, force_update_clone.clone());
+            // 首次进入循环即强制全量构建（含 BM25 / 模糊匹配），
+            // 不依赖外接盘变化或 10 分钟定时，保证启动即可搜。
+            force_update_clone.store(true, Ordering::Relaxed);
             let mut last_volumes = std::collections::HashSet::new();
             let mut last_full_scan = std::time::Instant::now();
 
