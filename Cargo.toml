@@ -1,8 +1,8 @@
 [workspace]
-members = ["src-tauri"]
+members = ["src-tauri", "crates/sts-core", "crates/sts-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "1.0.0"
+version = "2.2.0"
 edition = "2021"
 authors = ["星TAP实验室 <cscb603@qq.com>"]
