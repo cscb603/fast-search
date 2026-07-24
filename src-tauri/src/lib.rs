@@ -73,10 +73,8 @@ impl AppCache {
             mcp_port: Arc::new(Mutex::new(None)),
         };
         cache.load_click_history();
-        // 启动即构建 BM25 语义索引 + 模糊匹配器（若已有缓存立即可用；无缓存由后台循环补充）
-        // BM25 + 模糊匹配器暂禁用（需 tantivy 库，当前环境版本不兼容）
-        // cache.index.rebuild_bm25();
-        // cache.index.rebuild_fuzzy();
+        // BM25 语义索引 + 模糊匹配器在索引构建/更新时由 build_index_once /
+        // start_indexing_loop 自动重建（见 sts-core），此处无需手动触发
         cache
     }
 
@@ -130,13 +128,16 @@ async fn search_files(
     // 空关键词时返回最近文件（按修改日期倒序）
     if keyword_lc.trim().is_empty() {
         let results = sts_core::recent_files(&filter_type, 50).await;
-        let converted: Vec<SearchResult> = results.into_iter().map(|r| SearchResult {
-            path: r.path,
-            name: r.name,
-            score: r.score.unwrap_or(0),
-            elapsed_ms: r.elapsed_ms,
-            source: r.source,
-        }).collect();
+        let converted: Vec<SearchResult> = results
+            .into_iter()
+            .map(|r| SearchResult {
+                path: r.path,
+                name: r.name,
+                score: r.score.unwrap_or(0),
+                elapsed_ms: r.elapsed_ms,
+                source: r.source,
+            })
+            .collect();
         return Ok(converted);
     }
 
