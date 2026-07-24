@@ -35,6 +35,8 @@ impl Bm25Index {
         }
         // 重建前清空旧索引，避免 segment 累积
         let _ = std::fs::remove_dir_all(&dir);
+        // tantivy 0.26 的 Index::create_in_dir 不会自动创建目录，需先建好
+        let _ = std::fs::create_dir_all(&dir);
 
         let mut schema_builder = Schema::builder();
         // 文件名：中文分词索引 + 存储
@@ -142,5 +144,76 @@ impl Bm25Index {
         }
 
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tantivy::schema::Schema;
+
+    /// 验证 tantivy 0.26 修复（create_in_dir 需先建目录）后 BM25 中文分词搜索可用。
+    /// 用临时目录隔离，不依赖 HOME/Library/Caches。
+    #[test]
+    fn test_bm25_chinese_tokenize_search() {
+        let dir = std::env::temp_dir().join("sts_bm25_self_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut schema_builder = Schema::builder();
+        let name_field = schema_builder.add_text_field(
+            "name",
+            TextOptions::default()
+                .set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("jieba")
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                )
+                .set_stored(),
+        );
+        let path_field = schema_builder.add_text_field("path", TextOptions::default().set_stored());
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_dir(&dir, schema).expect("create_in_dir 应成功（已先建目录）");
+        index.tokenizers().register("jieba", JiebaTokenizer::new());
+
+        let files = vec![
+            "/Users/xtap/Desktop/合肥照片2026.txt".to_string(),
+            "/Users/xtap/Desktop/旅游照片合集.pdf".to_string(),
+            "/Users/xtap/Documents/report.docx".to_string(),
+        ];
+        {
+            let mut writer = index.writer(50_000_000).unwrap();
+            for p in &files {
+                let name = p.split('/').next_back().unwrap();
+                let mut doc = TantivyDocument::new();
+                doc.add_text(name_field, name);
+                doc.add_text(path_field, p);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().unwrap();
+        }
+
+        let bm25 = Bm25Index {
+            index,
+            name_field,
+            path_field,
+        };
+
+        // 分词：『合肥』应精确命中名含『合肥照片2026』的文件
+        let res = bm25.search("合肥", "all", 10);
+        assert!(
+            res.iter().any(|r| r.path.contains("合肥照片2026")),
+            "BM25 应能用分词搜到 合肥照片2026，实际: {:?}",
+            res
+        );
+
+        // 分词：『照片』应同时命中多个含该词的文件（jieba 切词）
+        let res2 = bm25.search("照片", "all", 10);
+        assert!(
+            res2.len() >= 2,
+            "BM25 应分词命中多个含『照片』文件，实际: {:?}",
+            res2
+        );
     }
 }
