@@ -7,10 +7,10 @@ async function updateIndexingStatus() {
     const isIndexing = await invoke('get_indexing_status');
     const statusEl = document.getElementById('indexing-status');
     if (isIndexing) {
-      statusEl.textContent = '(正在更新外接盘索引...)';
+      statusEl.textContent = '🔄 索引构建中...已扫描常用目录，可先搜索';
       statusEl.style.color = '#ff9800';
     } else {
-      statusEl.textContent = '(索引已就绪)';
+      statusEl.textContent = '✓ 索引已就绪';
       statusEl.style.color = '#4caf50';
     }
   } catch (e) {
