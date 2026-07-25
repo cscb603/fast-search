@@ -7,7 +7,7 @@ async function updateIndexingStatus() {
     const isIndexing = await invoke('get_indexing_status');
     const statusEl = document.getElementById('indexing-status');
     if (isIndexing) {
-      statusEl.textContent = '(正在更新索引...)';
+      statusEl.textContent = '(正在更新外接盘索引...)';
       statusEl.style.color = '#ff9800';
     } else {
       statusEl.textContent = '(索引已就绪)';
@@ -20,119 +20,6 @@ async function updateIndexingStatus() {
 
 setInterval(updateIndexingStatus, 5000);
 updateIndexingStatus();
-
-// MCP 服务端口显示（供 AI/Agent 接入；端口冲突时显示实际端口）
-async function updateMcpStatus() {
-  try {
-    const port = await invoke('get_mcp_port');
-    const el = document.getElementById('mcp-status');
-    if (!el) return;
-    if (port) {
-      el.textContent = `· MCP:${port}`;
-      el.title = `AI 接口已启动：http://127.0.0.1:${port}/tools`;
-    } else {
-      el.textContent = '';
-    }
-  } catch (e) { /* 忽略 */ }
-}
-updateMcpStatus();
-
-// ===== 主题切换 =====
-// 模式: "system"(默认,跟随系统) / "light" / "dark" / "auto"(按早晚,6-18=浅,18-6=深)
-const THEME_KEY = 'sts_theme_mode';
-
-function getThemeMode() {
-  return localStorage.getItem(THEME_KEY) || 'system';
-}
-
-function setThemeMode(mode) {
-  localStorage.setItem(THEME_KEY, mode);
-  applyTheme(mode);
-}
-
-function shouldBeDarkByAuto() {
-  const h = new Date().getHours();
-  return h < 6 || h >= 18; // 18:00~6:00 深色
-}
-
-function applyTheme(mode) {
-  const html = document.documentElement;
-  if (mode === 'light') {
-    html.setAttribute('data-theme', 'light');
-  } else if (mode === 'dark') {
-    html.setAttribute('data-theme', 'dark');
-  } else if (mode === 'auto') {
-    html.setAttribute('data-theme', shouldBeDarkByAuto() ? 'dark' : 'light');
-  } else {
-    // system — 清除 data-theme，由 prefers-color-scheme CSS 决定
-    html.removeAttribute('data-theme');
-  }
-  updateThemeIcon(mode);
-}
-
-function updateThemeIcon(mode) {
-  const btn = document.getElementById('theme-toggle');
-  if (!btn) return;
-  const icons = { system: '🖥️', light: '☀️', dark: '🌙', auto: '🌓' };
-  btn.textContent = icons[mode] || '🌓';
-  btn.title = {
-    system: '跟随系统 · 点击切换',
-    light: '浅色 · 点击切换',
-    dark: '深色 · 点击切换',
-    auto: '按早晚切换 · 点击切换'
-  }[mode] || '切换主题';
-}
-
-function cycleTheme() {
-  const order = ['system', 'light', 'dark', 'auto'];
-  const current = getThemeMode();
-  const idx = order.indexOf(current);
-  const next = order[(idx + 1) % order.length];
-  setThemeMode(next);
-}
-
-// 初始化主题
-applyTheme(getThemeMode());
-
-// 绑定按钮点击
-document.addEventListener('DOMContentLoaded', () => {
-  const btn = document.getElementById('theme-toggle');
-  if (btn) btn.addEventListener('click', cycleTheme);
-});
-
-// auto 模式：每 30 分钟检查一次时间段变化
-setInterval(() => {
-  if (getThemeMode() === 'auto') {
-    applyTheme('auto');
-  }
-}, 30 * 60 * 1000);
-
-// ===== 功能提示轮播 =====
-const TIPS = [
-  '💡 搜「微信」直达 WeChat · 搜「ps」直达 Photoshop',
-  '💡 缩略图预览 — 搜图片即看小图',
-  '💡 内容搜索 — 切到 🔍内容 搜文件内文字',
-  '💡 搜「报告 in:路径」搜索指定目录',
-  '💡 外接盘自动搜 — 文件/内容都覆盖',
-  '💡 点分类标签看最近文件（空搜索框）',
-  '💡 主题 🖥️ 点右上角切换深浅/自动',
-  '💡 BM25 中文分词 · 模糊纠错 · 别名直达',
-];
-let tipIndex = 0;
-let tipEl = null;
-
-function rotateTip() {
-  if (!tipEl) tipEl = document.getElementById('tip-text');
-  if (!tipEl) return;
-  tipIndex = (tipIndex + 1) % TIPS.length;
-  tipEl.textContent = TIPS[tipIndex];
-}
-function initTips() {
-  tipEl = document.getElementById('tip-text');
-  if (!tipEl) return;
-  tipEl.textContent = TIPS[0];
-  setInterval(rotateTip, 6000);
-}
 
 let searchInput;
 let resultsContainer;
@@ -150,29 +37,10 @@ async function performSearch(force = false) {
   }
   lastSearchKeyword = keyword;
   
-  // 内容搜索模式 (rg)
-  if (currentFilter === 'content') {
-    if (!keyword) {
-      resultsContainer.innerHTML = '<div class="no-results">输入关键词搜索文件内容 (ripgrep 极速引擎)</div>';
-      return;
-    }
-    resultsContainer.innerHTML = '<div class="loading">🔍 rg 极速内容搜索中...</div>';
-    try {
-      const results = await invoke("search_content_command", {
-        request: { keyword, path: "", filterType: "all", maxResults: 50 }
-      });
-      renderContentResults(results);
-    } catch (error) {
-      console.error("内容搜索出错:", error);
-      resultsContainer.innerHTML = `<div class="error">内容搜索失败: ${error}</div>`;
-    }
-    return;
-  }
-
   if (!keyword && currentFilter === 'all') {
-    resultsContainer.innerHTML = '<div class="loading">正在获取最近修改的文件...</div>';
+    resultsContainer.innerHTML = '<div class="loading">正在获取最近修改的文件 (V5)...</div>';
   } else {
-    resultsContainer.innerHTML = '<div class="loading">V7 BM25 语义引擎正在扫描...</div>';
+    resultsContainer.innerHTML = '<div class="loading">V5 引擎正在极速扫描...</div>';
   }
 
   try {
@@ -209,31 +77,7 @@ function getFileIcon(result) {
   return '📄';
 }
 
-// 缩略图懒加载：进入视口才向后端请求 qlmanage 生成，命中即替换图标
-const _thumbObserver = ('IntersectionObserver' in window)
-  ? new IntersectionObserver((entries, obs) => {
-      entries.forEach(async (entry) => {
-        if (!entry.isIntersecting) return;
-        const box = entry.target;
-        obs.unobserve(box);
-        const path = decodeURIComponent(box.dataset.thumbPath || '');
-        if (!path) return;
-        try {
-          const uri = await invoke('get_thumbnail', { path, size: 96 });
-          if (uri) {
-            box.innerHTML = `<img class="result-thumb" src="${uri}" alt="" />`;
-          }
-        } catch (_) { /* 生成失败保留原图标，不影响使用 */ }
-      });
-    }, { root: null, rootMargin: '120px' })
-  : null;
-
-function observeThumbnail(box) {
-  if (box && _thumbObserver) _thumbObserver.observe(box);
-}
-
 function renderResults(results) {
-  // 上一批的 observer 目标随 DOM 清空自动失效，无需手动 disconnect
   resultsContainer.innerHTML = '';
   
   if (results.length === 0) {
@@ -241,22 +85,24 @@ function renderResults(results) {
     return;
   }
 
+  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'svg', 'bmp', 'tiff', 'tif'];
+  let thumbQueue = [];
+
   results.forEach(result => {
-    // 增加严格过滤，确保前端不渲染路径或名称为空的坏数据
     if (!result.name || !result.path || result.name.trim() === "" || result.path.trim() === "") {
         return;
     }
 
     const item = document.createElement('div');
     item.className = 'result-item';
-    
-    // 双击打开文件
     item.ondblclick = () => openFile(result.path);
 
+    const ext = result.name.split('.').pop().toLowerCase();
+    const isImage = imageExts.includes(ext);
     const icon = getFileIcon(result);
 
     item.innerHTML = `
-      <div class="result-icon-box" data-thumb-path="${encodeURIComponent(result.path)}">${icon}</div>
+      <div class="result-icon-box" data-thumb-path="${isImage ? encodeURIComponent(result.path) : ''}">${icon}</div>
       <div class="result-info">
         <span class="result-name">${result.name}</span>
         <span class="result-path">${result.path}</span>
@@ -268,10 +114,7 @@ function renderResults(results) {
       </div>
     `;
 
-    // 缩略图懒加载（进入视口才生成，避免一次性拉起大量 qlmanage 进程）
-    observeThumbnail(item.querySelector('.result-icon-box'));
-
-    // 绑定事件，避免使用 innerHTML 中的 onclick 以提高性能和可靠性
+    // 绑定事件
     item.querySelector('.copy-btn').onclick = (e) => {
         e.stopPropagation();
         copyPath(result.path, e.target);
@@ -284,90 +127,42 @@ function renderResults(results) {
         e.stopPropagation();
         openFolder(result.path);
     };
-
-    // 单击信息部分也可以直接打开文件/文件夹（提升体验）
     item.querySelector('.result-info').onclick = (e) => {
         openFile(result.path);
     };
 
     resultsContainer.appendChild(item);
-  });
-}
 
-// 内容搜索结果渲染 (rg 输出，带行号和内容预览)
-function renderContentResults(results) {
-  resultsContainer.innerHTML = '';
-  
-  if (results.length === 0) {
-    resultsContainer.innerHTML = '<div class="no-results">未在文件内容中找到匹配项</div>' +
-      '<div class="no-results-hint">提示：默认搜索「桌面 / 下载」，已自动跳过程序包、模型库、缓存、日志等大型目录。' +
-      '如要搜其他位置（如文稿），可在搜索词后加 <b>in:路径</b>（例：报告 in:/Users/你的名/Documents）。</div>';
-    return;
+    // 图片文件入队，后续批量加载缩略图
+    if (isImage) {
+      thumbQueue.push(result.path);
+    }
+  });
+
+  // 批量懒加载缩略图（最多同时 3 个，避免 qlmanage 风暴）
+  if (thumbQueue.length > 0) {
+    let idx = 0;
+    const loadNext = () => {
+      if (idx >= thumbQueue.length) return;
+      const path = thumbQueue[idx++];
+      const box = document.querySelector(`.result-icon-box[data-thumb-path="${encodeURIComponent(path)}"]`);
+      if (!box) { loadNext(); return; }
+      invoke('get_thumbnail', { path, size: 96 })
+        .then(b64 => {
+          if (b64) {
+            box.innerHTML = `<img src="${b64}" class="thumb-img" alt="缩略图" style="width:48px;height:48px;border-radius:6px;object-fit:cover;">`;
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          setTimeout(loadNext, 100);
+        });
+    };
+    // 启动 3 个并行加载
+    loadNext();
+    loadNext();
+    loadNext();
   }
-
-  results.forEach(result => {
-    if (!result.name || !result.path) return;
-
-    const item = document.createElement('div');
-    item.className = 'result-item content-result';
-    
-    item.ondblclick = () => openFile(result.path);
-
-    const icon = getFileIcon(result);
-
-    // 高亮关键词在内容行中的位置
-    const keyword = searchInput.value.trim();
-    const highlightedContent = highlightKeyword(result.line_content, keyword);
-
-    item.innerHTML = `
-      <div class="result-icon-box">${icon}</div>
-      <div class="result-info">
-        <span class="result-name">${result.name} <span class="line-number">:${result.line_number}</span></span>
-        <span class="content-preview">${highlightedContent}</span>
-        <span class="result-path">${result.path}</span>
-      </div>
-      <div class="result-actions">
-        <button class="action-btn copy-btn" title="复制路径">复制</button>
-        <button class="action-btn open-btn" title="直接打开">打开</button>
-        <button class="action-btn folder-btn" title="打开所在位置">位置</button>
-      </div>
-    `;
-
-    item.querySelector('.copy-btn').onclick = (e) => {
-        e.stopPropagation();
-        copyPath(result.path, e.target);
-    };
-    item.querySelector('.open-btn').onclick = (e) => {
-        e.stopPropagation();
-        openFile(result.path);
-    };
-    item.querySelector('.folder-btn').onclick = (e) => {
-        e.stopPropagation();
-        openFolder(result.path);
-    };
-
-    item.querySelector('.result-info').onclick = (e) => {
-        openFile(result.path);
-    };
-
-    resultsContainer.appendChild(item);
-  });
-}
-
-// 关键词高亮
-function highlightKeyword(text, keyword) {
-  if (!keyword) return escapeHtml(text);
-  const escaped = escapeHtml(text);
-  const keywordEscaped = escapeHtml(keyword);
-  const regex = new RegExp(`(${keywordEscaped.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
-  return escaped.replace(regex, '<mark>$1</mark>');
-}
-
-// HTML 转义
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
 }
 
 async function openFile(path) {
@@ -429,28 +224,33 @@ window.addEventListener("DOMContentLoaded", () => {
   resultsContainer = document.querySelector("#results");
   const tabs = document.querySelectorAll(".tab-btn");
 
-  initTips(); // 启动功能提示轮播
-
   // 搜索输入监听
-  searchInput.addEventListener("compositionstart", () => { isComposing = true; });
+  searchInput.addEventListener("compositionstart", () => {
+    isComposing = true;
+  });
+
   searchInput.addEventListener("compositionend", () => {
     isComposing = false;
+    // IME 输入结束后触发一次搜索
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(() => performSearch(), 300);
   });
+
   searchInput.addEventListener("input", () => {
-    if (isComposing) return;
+    if (isComposing) return; // 正在输入拼音时不触发
     clearTimeout(searchTimeout);
-    searchTimeout = setTimeout(() => performSearch(), 200);
+    searchTimeout = setTimeout(() => performSearch(), 300);
   });
+
   searchInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !isComposing) {
+    if (e.key === "Enter") {
+      if (isComposing) return; // 如果正在选词，回车不触发搜索
       clearTimeout(searchTimeout);
-      performSearch(true);
+      performSearch(true); // 强制搜索
     }
   });
 
-  // 标签切换：空关键词时显示最近文件
+  // 标签切换监听
   tabs.forEach(tab => {
     tab.addEventListener("click", () => {
       tabs.forEach(t => t.classList.remove("active"));

@@ -1,12 +1,11 @@
 //! MCP HTTP 服务（给 AI / Agent 用的「另一张脸」）。
 //! 复用 core_lib::mcp 基座：`/health`、`/tools`、`/` 壳层自动生成，
-//! 业务只挂 `POST /search`、`POST /content`、`POST /thumbnail` 三个 handler。
+//! 业务只挂 `POST /search`、`POST /thumbnail` 两个 handler。
 //!
-//! 端口策略（§2.6.4）：默认 9877（禁用 9876=sts-x），占用则 +1 探测到 9897；
-//! 支持 `STS_MCP_PORT` 强制指定；实际端口写 `mcp_port` 文件并回传 GUI 状态栏。
+//! 端口策略：默认 9877，占用则 +1 探测到 9897；支持 `STS_MCP_PORT` 强制指定；
+//! 实际端口写 mcp_port 文件并回传 GUI 状态栏。
 //!
-//! 双模式：MCP 默认 `human_mode=false`（AI 全量，不过滤不降级）；
-//! 工具入参 `human_filter=true` 时复用人类模式过滤（给人看的结果）。
+//! 搜索核心：mdfind 即时（文件名 + 内容，覆盖本地卷与外接盘），毫秒级、零句柄。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,7 +15,7 @@ use core_lib::mcp::axum::{extract::State, routing::post, Json, Router};
 use core_lib::mcp::{McpServer, Tool};
 use serde::Deserialize;
 use serde_json::json;
-use sts_core::{ContentSearchParams, GlobalIndex};
+use sts_core::GlobalIndex;
 
 const DEFAULT_PORT: u16 = 9877;
 const MAX_PROBE: u16 = 20; // 9877..=9897
@@ -24,6 +23,7 @@ const MAX_PROBE: u16 = 20; // 9877..=9897
 #[derive(Clone)]
 struct McpState {
     index: GlobalIndex,
+    #[allow(dead_code)]
     mapping: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -44,9 +44,6 @@ struct SearchReq {
     keyword: String,
     #[serde(default = "default_all", alias = "filterType")]
     filter_type: String,
-    /// true = 复用人类过滤（去系统垃圾 + 代码降级）；默认 false = AI 全量
-    #[serde(default)]
-    human_filter: bool,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -55,23 +52,24 @@ async fn handle_search(
     State(st): State<McpState>,
     Json(req): Json<SearchReq>,
 ) -> Json<serde_json::Value> {
-    let mapping = st.mapping.lock().unwrap().clone();
-    let empty_clicks: HashMap<String, u32> = HashMap::new();
-
-    // 空关键词时返回最近文件（与 GUI 一致）
-    let results = if req.keyword.trim().is_empty() {
-        sts_core::recent_files(&req.filter_type, req.limit.unwrap_or(100)).await
+    let mut results = if req.keyword.trim().is_empty() {
+        st.index
+            .recent_files(&req.filter_type, req.limit.unwrap_or(100))
+            .await
     } else {
-        sts_core::search_files(
-            &req.keyword,
-            &req.filter_type,
-            &st.index,
-            &empty_clicks,
-            &mapping,
-            req.human_filter,
-        )
-        .await
+        st.index.search_files(&req.keyword, &req.filter_type).await
     };
+
+    // 外盘 fd 兜底：当 mdfind 未搜到结果且外盘未被 Spotlight 索引时，
+    // 用 fd 实时搜索 /Volumes（exFAT 等外盘专用）。0.2-5s 内返回，结束后释放句柄。
+    if results.is_empty() && !st.index.external_indexed() && !req.keyword.trim().is_empty() {
+        let kw = req.keyword.clone();
+        let ext = tokio::task::spawn_blocking(move || sts_core::search_external_find(&kw, 100))
+            .await
+            .unwrap_or_default();
+        results.extend(ext);
+    }
+
     let take = req.limit.unwrap_or(100);
     let items: Vec<serde_json::Value> = results
         .into_iter()
@@ -79,38 +77,6 @@ async fn handle_search(
         .map(|r| json!({ "name": r.name, "path": r.path }))
         .collect();
     Json(json!({ "count": items.len(), "results": items }))
-}
-
-// ---------------- 内容搜索 ----------------
-
-#[derive(Deserialize)]
-struct ContentReq {
-    keyword: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default = "default_all")]
-    filter_type: String,
-    #[serde(default = "default_max_results")]
-    max_results: usize,
-}
-
-async fn handle_content(Json(req): Json<ContentReq>) -> Json<serde_json::Value> {
-    let params = ContentSearchParams {
-        keyword: req.keyword,
-        path: req.path,
-        filter_type: req.filter_type,
-        max_results: req.max_results,
-    };
-    match sts_core::search_content(params).await {
-        Ok(rs) => {
-            let items: Vec<serde_json::Value> = rs
-                .into_iter()
-                .map(|r| json!({ "path": r.path, "name": r.name, "line": r.line_number, "content": r.line_content }))
-                .collect();
-            Json(json!({ "count": items.len(), "results": items }))
-        }
-        Err(e) => Json(json!({ "error": e })),
-    }
 }
 
 // ---------------- 缩略图 ----------------
@@ -164,31 +130,19 @@ fn probe_port() -> Option<u16> {
         .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
 }
 
-/// 构建 MCP Server（含三工具声明 + 业务路由）。抽出以便测试其 into_router()。
+/// 构建 MCP Server（含工具声明 + 业务路由）。抽出以便测试其 into_router()。
 fn build_server(state: McpState) -> McpServer {
     let biz = Router::new()
         .route("/search", post(handle_search))
-        .route("/content", post(handle_content))
         .route("/thumbnail", post(handle_thumbnail))
         .with_state(state);
 
     let search_schema = json!({
         "type": "object",
         "properties": {
-            "keyword": { "type": "string", "description": "搜索关键词（支持中文分词、别名、缩写、编辑距离纠错）" },
-            "filter_type": { "type": "string", "description": "类型过滤：all/image/video/audio/doc/code 等", "default": "all" },
-            "human_filter": { "type": "boolean", "description": "true=复用人类模式过滤(去系统垃圾+代码降级)；默认 false=AI 全量", "default": false },
+            "keyword": { "type": "string", "description": "搜索关键词（文件名或内容，Spotlight 毫秒级；支持别名 ps→Photoshop）" },
+            "filter_type": { "type": "string", "description": "类型过滤：all/image/video/audio/doc/folder/app 等", "default": "all" },
             "limit": { "type": "integer", "description": "返回条数上限，默认 100", "default": 100 }
-        },
-        "required": ["keyword"]
-    });
-    let content_schema = json!({
-        "type": "object",
-        "properties": {
-            "keyword": { "type": "string", "description": "文件内容检索词（rg 后端）" },
-            "path": { "type": "string", "description": "限定搜索目录，空=Desktop+Downloads+Documents+/Volumes（外接盘自动扫）；用 in:/自定义路径 指定其他位置" },
-            "filter_type": { "type": "string", "description": "类型过滤", "default": "all" },
-            "max_results": { "type": "integer", "description": "最大结果数", "default": 50 }
         },
         "required": ["keyword"]
     });
@@ -201,20 +155,17 @@ fn build_server(state: McpState) -> McpServer {
         "required": ["path"]
     });
 
-    let instructions = "星TAP 极速搜索 MCP：文件名搜索(search_files) / 内容搜索(search_content) / 缩略图(get_thumbnail)。\
-        默认 AI 全量模式(不过滤系统文件、不降级代码)；search_files 传 human_filter=true 可复用人类过滤。";
+    let instructions = "星TAP 极速搜索 MCP：文件名/内容即时搜索(search_files) / 缩略图(get_thumbnail)。\
+        基于 macOS Spotlight(mdfind)，毫秒级、覆盖本地卷与外接盘，关 app 即干净退出。";
 
     McpServer::new("star-tap-search", env!("CARGO_PKG_VERSION"), instructions)
-        .tool(Tool::new(
-            "search_files",
-            "按文件名搜索（BM25 中文分词 + 别名/缩写/编辑距离扩展）",
-            search_schema,
-        ))
-        .tool(Tool::new(
-            "search_content",
-            "按文件内容搜索（ripgrep 后端）",
-            content_schema,
-        ))
+        .tool(
+            Tool::new(
+                "search_files",
+                "按文件名/内容即时搜索（Spotlight 毫秒级，覆盖本地卷与外接盘）",
+                search_schema,
+            ),
+        )
         .tool(Tool::new(
             "get_thumbnail",
             "生成文件缩略图，返回 base64 PNG data URI",
@@ -259,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tools_endpoint() {
-        // 用基座 into_router() 起服务，raw TCP 请求 /tools 验证三工具已暴露
+        // 用基座 into_router() 起服务，raw TCP 请求 /tools 验证工具已暴露
         let state = McpState {
             index: GlobalIndex::empty(),
             mapping: Arc::new(Mutex::new(HashMap::new())),
@@ -287,9 +238,8 @@ mod tests {
         assert!(resp.contains("200 OK"), "应返回 200，实际: {}", resp);
         assert!(resp.contains("search_files"), "工具列表应含 search_files");
         assert!(
-            resp.contains("search_content"),
-            "工具列表应含 search_content"
+            resp.contains("get_thumbnail"),
+            "工具列表应含 get_thumbnail"
         );
-        assert!(resp.contains("get_thumbnail"), "工具列表应含 get_thumbnail");
     }
 }
