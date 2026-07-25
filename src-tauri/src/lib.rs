@@ -111,28 +111,50 @@ impl GlobalIndex {
                         scan_paths.push("/Volumes".to_string());
                     }
 
+                    let total_paths = scan_paths.len();
+                    let mut scanned = 0usize;
                     let mut all_files = Vec::new();
-                    for path in scan_paths {
+                    for path in &scan_paths {
                         if !std::path::Path::new(&path).exists() { continue; }
-                        println!("正在扫描路径: {} ...", path);
-                        
-                        let output = AsyncCommand::new("find")
-                            .arg(&path)
-                            .args(["(", "-path", "*/node_modules/*", "-o", "-path", "*/.git/*", "-o", "-path", "*/Library/*", "-o", "-path", "*/Contents/MacOS/*", "-o", "-name", ".*", ")", "-prune", "-o", "-print"])
-                            .output()
-                            .await;
+                        println!("正在扫描路径: {} ... (已扫描 {}/{})", path, scanned, total_paths);
+
+                        let output = {
+                            let rg = AsyncCommand::new("rg")
+                                .args(["--files", "-g", "!node_modules/**", "-g", "!.git/**",
+                                       "-g", "!Library/**", "-g", "!**/Contents/MacOS/**",
+                                       "-g", "!.**"])
+                                .arg(path)
+                                .output()
+                                .await;
+                            if let Ok(ref out) = rg {
+                                if out.status.success() {
+                                    rg
+                                } else {
+                                    fallback_find(path).await
+                                }
+                            } else {
+                                fallback_find(path).await
+                            }
+                        };
 
                         if let Ok(out) = output {
                             let content = String::from_utf8_lossy(&out.stdout);
-                            let mut count = 0;
+                            let mut batch = Vec::new();
                             for line in content.lines() {
                                 let p = line.to_string();
-                                if p != path && !p.is_empty() {
-                                    all_files.push(p);
-                                    count += 1;
+                                if p != path.as_str() && !p.is_empty() {
+                                    batch.push(p);
                                 }
                             }
-                            println!("路径 {} 扫描完成，找到 {} 个文件", path, count);
+                            // ★ 扫完一个盘立即加入共享索引，用户马上可搜
+                            {
+                                let mut guard = files_clone.lock().unwrap();
+                                guard.extend(batch.iter().cloned());
+                            }
+                            all_files.extend(batch);
+                            scanned += 1;
+                            println!("路径 {} 扫描完成，找到 {} 个文件（已扫描 {}/{}）",
+                                path, scanned, scanned, total_paths);
                         }
                     }
                     
@@ -820,6 +842,17 @@ fn get_thumbnail(path: String, size: Option<u32>) -> Result<Option<String>, Stri
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
     Ok(result)
+}
+
+/// 回退方案：系统 find 命令（rg 不可用时使用）。
+async fn fallback_find(path: &str) -> Result<std::process::Output, std::io::Error> {
+    AsyncCommand::new("find")
+        .arg(path)
+        .args(["(", "-path", "*/node_modules/*", "-o", "-path", "*/.git/*",
+               "-o", "-path", "*/Library/*", "-o", "-path", "*/Contents/MacOS/*",
+               "-o", "-name", ".*", ")", "-prune", "-o", "-print"])
+        .output()
+        .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
