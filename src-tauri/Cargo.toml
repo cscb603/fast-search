@@ -1,10 +1,9 @@
 [package]
 name = "star-tap-fast-search"
-version = "2.2.0"
-description = "星TAP 极速搜索 - 基于 Tauri 2.0 的全硬盘秒级检索工具，堪比 Everything 的 Mac 极速搜索体验。集成 fd/rg 极客工具加速。"
+version = "2.0.0"
+description = "星TAP 极速搜索 - 基于 Tauri 2.0 的全硬盘秒级检索工具，堪比 Everything 的 Mac 极速搜索体验。"
 authors = ["星TAP实验室 <cscb603@qq.com>"]
 edition = "2021"
-default-run = "star-tap-fast-search"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -19,16 +18,24 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-sts-core = { path = "../crates/sts-core" }
-# MCP HTTP 服务基座（复用 core_lib::mcp，axum/tokio 由它 re-export）
-core_lib = { path = "../../rust_master_workspace/libs/core_lib", default-features = false, features = ["mcp"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-cli = "2"
+regex = "1.10"
 dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
+futures = "0.3.31"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"       # 针对体积进行优化 (s 或 z)
+lto = true           # 开启链接时间优化 (Link Time Optimization)
+codegen-units = 1     # 减少编译单元以提高优化效果
+panic = "abort"       # 发生 panic 时直接终止，减少体积
+strip = true         # 自动移除调试符号 (去除符号表)
+
