@@ -1,4 +1,7 @@
 # ⚡️ 星TAP | 极速搜索 (Fast Search)
+> **English / SEO:** StarTap Fast Search (macOS) is an Everything-like lightning file search for Mac. Millisecond results, full-disk + external-drive indexing, smart ranking, and fuzzy search — built with Rust + Tauri, fully local and private. The fast Spotlight alternative Mac users have been waiting for.
+>
+> **Tags:** macOS file search · Spotlight alternative · Everything for Mac · desktop search · fast finder · Rust + Tauri · local search · fuzzy search
 
 > **堪比 Everything 的 Mac 极速文件搜索神器。毫秒级响应，告别 Spotlight 的迟钝。**
 
@@ -77,3 +80,14 @@ Frustrated with the slow or incomplete indexing of macOS Spotlight? **Fast Searc
 
 ## 开源协议 (License)
 MIT License
+
+---
+
+## 📥 Download
+
+| | |
+|---|---|
+| **Releases** | https://github.com/cscb603/fast-search/releases/latest |
+| **StarTAP Lab** | 极致速度，极简生活 · Extreme speed, minimalist life |
+
+> Keywords: macOS file search · Spotlight alternative · Everything for Mac · desktop search · fast finder · Rust + Tauri · local search · fuzzy search
