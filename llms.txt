@@ -1,0 +1,18 @@
+# StarTap Fast Search for macOS (星TAP 极速搜索)
+
+> An Everything-like, millisecond file search for macOS — full-disk + external-drive indexing, fuzzy matching and smart ranking. 100% local, Rust + Tauri, privacy-first.
+
+StarTap Fast Search brings the legendary Everything speed to macOS. It indexes your entire disk and external drives, then returns matches in milliseconds. Fuzzy search tolerates typos; smart ranking surfaces the file you actually want. No cloud, no telemetry — everything runs locally.
+
+## Documentation
+- [README](https://github.com/cscb603/fast-search): Features, install, usage
+- [Releases](https://github.com/cscb603/fast-search/releases): macOS .dmg
+
+## Key capabilities
+- [Millisecond search](https://github.com/cscb603/fast-search): Everything-grade speed on macOS
+- [Full-disk + external drive indexing](https://github.com/cscb603/fast-search): Removable volumes included
+- [Fuzzy + smart ranking](https://github.com/cscb603/fast-search): Typo-tolerant, relevance-sorted
+- [100% local / offline](https://github.com/cscb603/fast-search): No network, no telemetry
+
+## Topics
+macOS, file search, Everything, fuzzy search, Rust, Tauri, offline, privacy, desktop app
