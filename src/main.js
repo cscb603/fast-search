@@ -26,7 +26,42 @@ let resultsContainer;
 let searchTimeout;
 let currentFilter = 'all';
 let lastSearchKeyword = '';
+let lastResults = []; // 最近一次搜索结果（Enter 快速打开 Top-1 用）
 let isComposing = false;
+
+// P4e: 语法提示轮转（恰当时刻提醒用法，防"想不起来"）
+const SYNTAX_HINTS = [
+  '语法：*.pdf 只搜 PDF 文件',
+  '语法：path:项目 按路径搜索',
+  '语法：size:>100m 大于 100MB',
+  '语法："完整短语" 精确匹配',
+  '语法：ps / wx / wps 直搜软件',
+  '回车 = 直接打开第一条结果',
+];
+let hintTimer = null;
+let hintIdx = 0;
+function showHint(text) {
+  const el = document.getElementById('syntax-hint');
+  if (el) el.textContent = text || '';
+}
+function startHintRotation() {
+  stopHintRotation();
+  hintTimer = setInterval(() => {
+    hintIdx = (hintIdx + 1) % SYNTAX_HINTS.length;
+    showHint(SYNTAX_HINTS[hintIdx]);
+  }, 7000);
+}
+function stopHintRotation() {
+  if (hintTimer) { clearInterval(hintTimer); hintTimer = null; }
+}
+function updateHintForInput(v) {
+  const t = v.trim();
+  if (t.startsWith('*.')) showHint('按扩展名搜索中：*.pdf 只搜 PDF · *.png 只搜图片');
+  else if (t.startsWith('path:')) showHint('按路径搜索中：path:项目 匹配路径含"项目"的文件');
+  else if (t.startsWith('size:')) showHint('按大小搜索中：size:>100m = 大于 100MB · size:<1g = 小于 1GB');
+  else if (t.startsWith('"')) showHint('精确短语搜索中："完整短语" 要求连续完整匹配');
+  else showHint(SYNTAX_HINTS[hintIdx]);
+}
 
 async function performSearch(force = false) {
   const keyword = searchInput.value.trim();
@@ -45,6 +80,7 @@ async function performSearch(force = false) {
 
   try {
     const results = await invoke("search_files", { keyword, filterType: currentFilter });
+    lastResults = results;
     renderResults(results);
   } catch (error) {
     console.error("搜索出错:", error);
@@ -77,66 +113,106 @@ function getFileIcon(result) {
   return '📄';
 }
 
+// P3a: 关键词匹配高亮（nucleo match_pos 为码点下标；顺带 HTML 转义防注入）
+function highlightName(name, positions) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  if (!positions || !positions.length) return esc(name);
+  const chars = Array.from(name);
+  const posSet = new Set(positions);
+  let html = '';
+  chars.forEach((c, i) => { html += posSet.has(i) ? `<mark>${esc(c)}</mark>` : esc(c); });
+  return html;
+}
+
+// P4d: 按类型分组（图片/视频/文档/应用/文件夹/其他）
+function groupResults(results) {
+  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'svg', 'bmp', 'tiff', 'tif'];
+  const videoExts = ['mp4', 'mov', 'avi', 'mkv', 'flv', 'wmv', 'm4v'];
+  const docExts = ['pdf', 'txt', 'md', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pages', 'numbers', 'keynote'];
+  const groups = { image: [], video: [], doc: [], app: [], folder: [], other: [] };
+  results.forEach(r => {
+    if (!r.name || !r.path) return;
+    const ext = (r.name.split('.').pop() || '').toLowerCase();
+    if (r.path.endsWith('.app') || r.path.endsWith('.app/')) groups.app.push(r);
+    else if (imageExts.includes(ext)) groups.image.push(r);
+    else if (videoExts.includes(ext)) groups.video.push(r);
+    else if (docExts.includes(ext)) groups.doc.push(r);
+    else if (!r.name.includes('.')) groups.folder.push(r);
+    else groups.other.push(r);
+  });
+  const order = [['image', '图片'], ['video', '视频'], ['doc', '文档'], ['app', '应用'], ['folder', '文件夹'], ['other', '其他']];
+  return order.map(([k, label]) => ({ label, items: groups[k] })).filter(g => g.items.length > 0);
+}
+
 function renderResults(results) {
   resultsContainer.innerHTML = '';
   
   if (results.length === 0) {
-    resultsContainer.innerHTML = '<div class="no-results">未找到匹配项，请尝试其他关键字</div>';
+    resultsContainer.innerHTML = '<div class="no-results">未找到匹配项。试试语法：<code>*.pdf</code> 扩展名 · <code>path:项目</code> 路径 · <code>size:>100m</code> 大小 · <code>"完整短语"</code> 精确</div>';
     return;
   }
 
   const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'svg', 'bmp', 'tiff', 'tif'];
   let thumbQueue = [];
 
-  results.forEach(result => {
-    if (!result.name || !result.path || result.name.trim() === "" || result.path.trim() === "") {
-        return;
-    }
+  const groups = groupResults(results);
+  groups.forEach(group => {
+    // 分组头（P4d）
+    const header = document.createElement('div');
+    header.className = 'group-header';
+    header.textContent = `${group.label} (${group.items.length})`;
+    resultsContainer.appendChild(header);
 
-    const item = document.createElement('div');
-    item.className = 'result-item';
-    item.ondblclick = () => openFile(result.path);
+    group.items.forEach(result => {
+      if (!result.name || !result.path || result.name.trim() === "" || result.path.trim() === "") {
+          return;
+      }
 
-    const ext = result.name.split('.').pop().toLowerCase();
-    const isImage = imageExts.includes(ext);
-    const icon = getFileIcon(result);
+      const item = document.createElement('div');
+      item.className = 'result-item';
+      item.ondblclick = () => openFile(result.path);
 
-    item.innerHTML = `
-      <div class="result-icon-box" data-thumb-path="${isImage ? encodeURIComponent(result.path) : ''}">${icon}</div>
-      <div class="result-info">
-        <span class="result-name">${result.name}</span>
-        <span class="result-path">${result.path}</span>
-      </div>
-      <div class="result-actions">
-        <button class="action-btn copy-btn" title="复制路径">复制</button>
-        <button class="action-btn open-btn" title="直接打开">打开</button>
-        <button class="action-btn folder-btn" title="打开所在位置">位置</button>
-      </div>
-    `;
+      const ext = result.name.split('.').pop().toLowerCase();
+      const isImage = imageExts.includes(ext);
+      const icon = getFileIcon(result);
 
-    // 绑定事件
-    item.querySelector('.copy-btn').onclick = (e) => {
-        e.stopPropagation();
-        copyPath(result.path, e.target);
-    };
-    item.querySelector('.open-btn').onclick = (e) => {
-        e.stopPropagation();
-        openFile(result.path);
-    };
-    item.querySelector('.folder-btn').onclick = (e) => {
-        e.stopPropagation();
-        openFolder(result.path);
-    };
-    item.querySelector('.result-info').onclick = (e) => {
-        openFile(result.path);
-    };
+      item.innerHTML = `
+        <div class="result-icon-box" data-thumb-path="${isImage ? encodeURIComponent(result.path) : ''}">${icon}</div>
+        <div class="result-info">
+          <span class="result-name">${highlightName(result.name, result.match_pos)}</span>
+          <span class="result-path">${result.path}</span>
+        </div>
+        <div class="result-actions">
+          <button class="action-btn copy-btn" title="复制路径">复制</button>
+          <button class="action-btn open-btn" title="直接打开">打开</button>
+          <button class="action-btn folder-btn" title="打开所在位置">位置</button>
+        </div>
+      `;
 
-    resultsContainer.appendChild(item);
+      // 绑定事件
+      item.querySelector('.copy-btn').onclick = (e) => {
+          e.stopPropagation();
+          copyPath(result.path, e.target);
+      };
+      item.querySelector('.open-btn').onclick = (e) => {
+          e.stopPropagation();
+          openFile(result.path);
+      };
+      item.querySelector('.folder-btn').onclick = (e) => {
+          e.stopPropagation();
+          openFolder(result.path);
+      };
+      item.querySelector('.result-info').onclick = (e) => {
+          openFile(result.path);
+      };
 
-    // 图片文件入队，后续批量加载缩略图
-    if (isImage) {
-      thumbQueue.push(result.path);
-    }
+      resultsContainer.appendChild(item);
+
+      // 图片文件入队，后续批量加载缩略图
+      if (isImage) {
+        thumbQueue.push(result.path);
+      }
+    });
   });
 
   // 批量懒加载缩略图（最多同时 3 个，避免 qlmanage 风暴）
@@ -238,6 +314,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   searchInput.addEventListener("input", () => {
     if (isComposing) return; // 正在输入拼音时不触发
+    updateHintForInput(searchInput.value); // P4e: 前缀感知提示
     clearTimeout(searchTimeout);
     searchTimeout = setTimeout(() => performSearch(), 300);
   });
@@ -245,6 +322,10 @@ window.addEventListener("DOMContentLoaded", () => {
   searchInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       if (isComposing) return; // 如果正在选词，回车不触发搜索
+      if (lastResults && lastResults.length > 0) {
+        openFile(lastResults[0].path); // 回车快速打开 Top-1（Everything 风格）
+        return;
+      }
       clearTimeout(searchTimeout);
       performSearch(true); // 强制搜索
     }
@@ -260,6 +341,8 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // 初始加载显示最近文件
+  // 初始加载显示最近文件 + 语法提示轮转（P4e）
+  startHintRotation();
+  showHint(SYNTAX_HINTS[0]);
   performSearch();
 });

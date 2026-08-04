@@ -13,6 +13,9 @@ use tokio::process::Command as AsyncCommand;
  struct SearchResult {
     path: String,
     name: String,
+    // P1: nucleo 匹配位置（码点下标，前端高亮用；空 = 不高亮）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    match_pos: Vec<u32>,
     // 内部字段，用于排序优化
     #[serde(skip)]
     score: i32,
@@ -231,9 +234,19 @@ impl AppCache {
             path.push("com.xtap.search");
             let _ = std::fs::create_dir_all(&path);
             path.push("click_history.json");
-            let mine = self.click_history.lock().unwrap();
-            if let Ok(content) = serde_json::to_string(&*mine) {
-                let _ = std::fs::write(path, content);
+            {
+                let mut mine = self.click_history.lock().unwrap();
+                // P3a: 上限清理，防无界增长与权重漂移（超 10000 条只保留点击最高的 5000）
+                if mine.len() > 10_000 {
+                    let mut entries: Vec<(String, u32)> = mine.drain().collect();
+                    entries.sort_by(|a, b| b.1.cmp(&a.1));
+                    entries.truncate(5_000);
+                    *mine = entries.into_iter().collect();
+                    println!("点击历史超限清理: 保留 {} 条", mine.len());
+                }
+                if let Ok(content) = serde_json::to_string(&*mine) {
+                    let _ = std::fs::write(&path, content);
+                }
             }
         }
     }
@@ -263,6 +276,16 @@ impl AppCache {
             ("db", "douban"), ("dy", "douyin"), ("bili", "bilibili"), ("bz", "bilibili"), ("music", "music"), 
             ("网易云", "neteasemusic"), ("spotify", "spotify"), ("douyin", "douyin"), ("tiktok", "douyin"),
             ("jianying", "videofusion"), ("jianyingpro", "videofusion"),
+            // 高频中文口语名 + 清理管家类（2026-07-31 补全）
+            ("腾讯会议", "wemeet"), ("wemeet", "wemeet"),
+            ("企业微信", "wecom"), ("企微", "wecom"), ("wecom", "wecom"),
+            ("百度网盘", "baidunetdisk"), ("网盘", "baidunetdisk"), ("baidunetdisk", "baidunetdisk"),
+            ("迅雷", "thunder"), ("thunder", "thunder"), ("语雀", "yuque"), ("yuque", "yuque"),
+            ("notion", "notion"), ("滴答清单", "ticktick"), ("ticktick", "ticktick"),
+            ("微博", "weibo"), ("weibo", "weibo"), ("小红书", "xiaohongshu"), ("xhs", "xiaohongshu"), ("xiaohongshu", "xiaohongshu"),
+            ("电脑管家", "tencent lemon"), ("腾讯电脑管家", "tencent lemon"), ("柠檬清理", "tencent lemon"), ("lemon", "tencent lemon"), ("tencentlemon", "tencent lemon"),
+            ("cleanmymac", "cleanmymac x"), ("cleanmymac x", "cleanmymac x"), ("appcleaner", "app cleaner"), ("app cleaner", "app cleaner"), ("macbooster", "macbooster"),
+            ("备忘录", "notes"), ("提醒事项", "reminders"), ("reminders", "reminders"),
             // 生产力
             ("wp", "wpsoffice"), ("wps", "wpsoffice"), ("word", "microsoft word"), ("excel", "microsoft excel"),
             ("ppt", "microsoft powerpoint"), ("pages", "pages"), ("numbers", "numbers"), ("keynote", "keynote"),
@@ -309,6 +332,115 @@ impl AppCache {
         let mut guard = self.mapping.lock().unwrap();
         *guard = new_map;
     }
+}
+
+/// 转义 NSPredicate 字符串字面量特殊字符（S4：防异常查询/转义破坏）
+fn escape_predicate(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// P4c: Everything-lite 语法解析结果
+#[derive(Clone)]
+struct LiteQuery {
+    terms: Vec<String>,        // 普通词（已去引号）
+    ext: Option<String>,       // 扩展名过滤（*.png）
+    path: Option<String>,      // 路径子串（path:/x/）
+    size: Option<(char, u64)>, // 大小过滤（size:>100m）
+}
+
+/// 解析 Everything-lite 语法：`*.ext` / `path:/x/` / `size:>100m` / `"短语"` / 普通词
+/// 非法 token（如 size:abc）降级为普通词，保证不吞查询
+fn parse_lite_syntax(kw: &str) -> LiteQuery {
+    let mut lite = LiteQuery { terms: Vec::new(), ext: None, path: None, size: None };
+    let mut phrase = String::new();
+    let mut in_quote = false;
+    for token in kw.split_whitespace() {
+        // 引号短语（跨空格）优先合并：`"hello world"` → 整词
+        if in_quote {
+            phrase.push(' ');
+            phrase.push_str(token.trim_end_matches('"'));
+            if token.ends_with('"') {
+                in_quote = false;
+                lite.terms.push(std::mem::take(&mut phrase));
+            }
+            continue;
+        }
+        if token.starts_with('"') && !token.ends_with('"') && token.len() > 1 {
+            in_quote = true;
+            phrase = token.trim_start_matches('"').to_string();
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("*.") {
+            let ext: String = rest.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            if !ext.is_empty() { lite.ext = Some(ext); }
+        } else if let Some(rest) = token.strip_prefix("path:") {
+            let p = rest.trim().trim_matches('/').to_lowercase();
+            if !p.is_empty() { lite.path = Some(p); }
+        } else if let Some(rest) = token.strip_prefix("size:") {
+            if let Some((op, num)) = parse_size(rest) { lite.size = Some((op, num)); }
+            else { lite.terms.push(token.to_string()); } // 解析失败降级普通词
+        } else {
+            let t = token.trim_matches('"');
+            if !t.is_empty() { lite.terms.push(t.to_string()); }
+        }
+    }
+    // 未闭合引号：累积短语降级为普通词
+    if in_quote && !phrase.is_empty() { lite.terms.push(phrase); }
+    lite
+}
+
+/// 解析 size 条件：`>100m` / `<2g`（k/m/g/b 单位，1k=1024）
+fn parse_size(s: &str) -> Option<(char, u64)> {
+    let s = s.trim();
+    let (op, rest) = if let Some(r) = s.strip_prefix('>') { ('>', r) }
+        else if let Some(r) = s.strip_prefix('<') { ('<', r) }
+        else { return None; };
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if num.is_empty() { return None; }
+    let unit: char = rest.chars().skip(num.len()).next().unwrap_or('b');
+    let mult: u64 = match unit.to_ascii_lowercase() {
+        'k' => 1024,
+        'm' => 1024 * 1024,
+        'g' => 1024 * 1024 * 1024,
+        _ => 1,
+    };
+    num.parse::<u64>().ok().map(|n| (op, n * mult))
+}
+
+/// 构造 NSPredicate：词(文件名 OR 路径, AND) + 别名(OR 逃生) + ext/path/size + 分类，全部 AND
+fn build_lite_query(strategy: &SearchStrategy, lite: &LiteQuery, alias: Option<&String>) -> String {
+    let mut conds: Vec<String> = Vec::new();
+    let mut term_parts: Vec<String> = Vec::new();
+    for w in &lite.terms {
+        term_parts.push(format!(
+            "(kMDItemFSName == '*{}*'cd || kMDItemPath == '*{}*'cd)",
+            escape_predicate(w), escape_predicate(w)
+        ));
+    }
+    let base = if term_parts.is_empty() && alias.is_none() {
+        None
+    } else if term_parts.is_empty() {
+        Some(format!("kMDItemFSName == '*{}*'cd", escape_predicate(alias.unwrap())))
+    } else if let Some(a) = alias {
+        Some(format!("({}) || kMDItemFSName == '*{}*'cd", term_parts.join(" && "), escape_predicate(a)))
+    } else {
+        Some(format!("({})", term_parts.join(" && ")))
+    };
+    if let Some(b) = base { conds.push(b); }
+    if let Some(ext) = &lite.ext {
+        conds.push(format!("kMDItemFSName == '*.{}'cd", escape_predicate(ext)));
+    }
+    if let Some(p) = &lite.path {
+        conds.push(format!("kMDItemPath contains '{}'cd", escape_predicate(p)));
+    }
+    if let Some((op, bytes)) = lite.size {
+        conds.push(format!("kMDItemFSSize {} {}", op, bytes));
+    }
+    if !strategy.spotlight_kind.is_empty() {
+        conds.push(strategy.spotlight_kind.clone());
+    }
+    if conds.is_empty() { return strategy.spotlight_kind.clone(); }
+    format!("({})", conds.join(" && "))
 }
 
 /// 搜索策略配置，解耦不同分类的搜索逻辑
@@ -359,7 +491,12 @@ impl SearchStrategy {
         let mut parts = Vec::new();
         for word in words {
             if !word.is_empty() {
-                parts.push(format!("kMDItemFSName == '*{}*'cd", word));
+                // P4b：文件名 OR 路径匹配（Everything 特色：路径也搜）
+                parts.push(format!(
+                    "(kMDItemFSName == '*{}*'cd || kMDItemPath == '*{}*'cd)",
+                    escape_predicate(word),
+                    escape_predicate(word)
+                ));
             }
         }
 
@@ -416,6 +553,7 @@ async fn search_files_internal(
 ) -> Result<Vec<SearchResult>, String> {
     let start_time = std::time::Instant::now();
     let keyword_lc = keyword.to_lowercase();
+    let lite = parse_lite_syntax(&keyword_lc);
     
     if keyword_lc.trim().is_empty() {
         return Ok(Vec::new());
@@ -430,13 +568,13 @@ async fn search_files_internal(
         let strategy = SearchStrategy::from_type(&filter_type_inner);
         let mapping = state.mapping.lock().unwrap().clone();
         let mapped_keyword = mapping.get(&keyword_lc).cloned();
+        let lite = lite.clone();
         
         tokio::spawn(async move {
             let mut results = Vec::new();
             
-            // 使用策略对象生成标准 Spotlight 查询
-            let words: Vec<&str> = keyword_lc.split_whitespace().collect();
-            let final_query = strategy.spotlight_query(&words, mapped_keyword.as_ref());
+            // P4c: Everything-lite + 路径匹配构造 Spotlight 查询
+            let final_query = build_lite_query(&strategy, &lite, mapped_keyword.as_ref());
             
             println!("Spotlight 原始查询: {}", final_query);
 
@@ -478,16 +616,53 @@ async fn search_files_internal(
 
             // 2. 并行执行所有任务
             let task_results = futures::future::join_all(tasks).await;
+            let joined: Vec<String> = task_results.into_iter().flatten().collect();
 
-            for content in task_results.into_iter().flatten() {
+            // 3. 深度兜底（T-8 决策）：mdfind 全空时，全 $HOME rg 按关键词过滤（5s 超时，取前 100）
+            let deep_results: Vec<SearchResult> = if joined.iter().all(|s| s.trim().is_empty()) {
+                let home = std::env::var("HOME").unwrap_or_default();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    AsyncCommand::new("rg")
+                        .args(["--files", "-g", "!node_modules/**", "-g", "!.git/**",
+                               "-g", "!Library/**", "-g", "!**/Contents/MacOS/**", "-g", "!.**"])
+                        .arg(&home)
+                        .output()
+                ).await {
+                    Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|p| !p.is_empty())
+                        .filter(|p| {
+                            let n = p.split('/').next_back().unwrap_or("").to_lowercase();
+                            n.contains(&keyword_lc)
+                        })
+                        .take(100)
+                        .map(|p| {
+                            let name = p.split('/').next_back().unwrap_or(p).to_string();
+                            SearchResult { path: p.to_string(), name, score: 0, match_pos: Vec::new() }
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+
+            // 4. 解析 mdfind 结果（获取阶段 cap 2000，防 T2 结果集爆炸）
+            let mut cap = 0usize;
+            for content in &joined {
                 for line in content.lines() {
+                    if cap >= 2000 { break; }
                     let path = line.trim().to_string();
                     if path.is_empty() || path.contains("/Contents/MacOS/") || path.contains("/Library/") { continue; }
                     
                     let name = path.split('/').next_back().unwrap_or(&path).to_string();
-                    results.push(SearchResult { path, name, score: 0 });
+                    results.push(SearchResult { path, name, score: 0, match_pos: Vec::new() });
+                    cap += 1;
                 }
+                if cap >= 2000 { break; }
             }
+            results.extend(deep_results);
             results
         })
     };
@@ -498,8 +673,9 @@ async fn search_files_internal(
         let index_files = state.index.files.clone();
         let strategy = SearchStrategy::from_type(&filter_type);
         let mapping = state.mapping.lock().unwrap().clone();
+        let lite = lite.clone();
         
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
             let mut fallback_results = Vec::new();
             let start = std::time::Instant::now();
@@ -511,7 +687,7 @@ async fn search_files_internal(
                 std::collections::HashSet::new()
             };
 
-            let words: Vec<&str> = keyword_lc.split_whitespace().collect();
+            let words: Vec<&str> = lite.terms.iter().map(|s| s.as_str()).collect();
             let guard = index_files.lock().unwrap();
             
             for path in guard.iter() {
@@ -538,6 +714,14 @@ async fn search_files_internal(
                 let name = path.split('/').next_back().unwrap_or(path).to_string();
                 let name_lc = name.to_lowercase();
                 let path_lc = path.to_lowercase();
+
+                // P4c: 内存侧 ext/path 过滤
+                if let Some(ext) = &lite.ext {
+                    if !name_lc.ends_with(&format!(".{}", ext)) { continue; }
+                }
+                if let Some(p) = &lite.path {
+                    if !path_lc.contains(p) { continue; }
+                }
                 
                 // 3. 多词匹配逻辑 (仿 Everything：多词 AND 匹配)
                 let mut matched_count = 0;
@@ -569,10 +753,10 @@ async fn search_files_internal(
                 }
                 
                 if matched_count == words.len() {
-                    results.push(SearchResult { path: path.clone(), name, score: 0 });
+                    results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
                 } else if matched_count > 0 && words.len() > 1 {
                     // 记录部分匹配的结果，作为 fallback
-                    fallback_results.push(SearchResult { path: path.clone(), name, score: 0 });
+                    fallback_results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
                 }
 
                 if results.len() > 1000 { break; }
@@ -588,10 +772,19 @@ async fn search_files_internal(
         })
     };
 
-    // 等待所有并行任务完成
-    let (spotlight_res, memory_res) = tokio::join!(spotlight_handle, memory_handle);
-    let spotlight_results = spotlight_res.unwrap_or_default();
-    let memory_results = memory_res.unwrap_or_default();
+    // P4a：先等 Spotlight（毫秒级）；内存索引仅在结果不足时限时兜底，不再每次全遍历拖慢
+    let spotlight_results = spotlight_handle.await.unwrap_or_default();
+    let memory_results = if spotlight_results.len() < 15 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            memory_handle,
+        ).await {
+            Ok(Ok(r)) => r,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
     
     println!("Spotlight 返回: {} 条, 内存索引返回: {} 条", spotlight_results.len(), memory_results.len());
     
@@ -604,6 +797,9 @@ async fn search_files_internal(
     let mapped_keyword = mapping.get(&keyword_lc).cloned();
     
     all_results.retain(|r| seen.insert(r.path.clone()));
+
+    // P1: nucleo 模糊匹配器（复用单例，135KB 暂存不重复分配）
+    let mut matcher = nucleo::Matcher::new(nucleo::Config::DEFAULT);
 
     for res in all_results.iter_mut() {
         let name_lc = res.name.to_lowercase();
@@ -679,7 +875,7 @@ async fn search_files_internal(
 
         // B. 点击历史加成 (权重最高，体现自学习)
         if let Some(&clicks) = history.get(&res.path) {
-            base_score += (clicks as i32) * 5000; // 显著提高点击权重
+            base_score += (clicks.min(10) as i32) * 5000; // 显著提高点击权重（P3a：封顶 10 次防单文件长期主导）
         }
 
         // C. 路径深度与嵌套惩罚
@@ -701,11 +897,38 @@ async fn search_files_internal(
             base_score += 1000;
         }
 
+        // P1: nucleo 模糊匹配分（子序列贴合度，微秒级，越贴合分越高）
+        if !keyword_lc.is_empty() {
+            let mut hbuf: Vec<char> = Vec::new();
+            let mut nbuf: Vec<char> = Vec::new();
+            if let Some(nscore) = matcher.fuzzy_match(
+                nucleo::Utf32Str::new(name_lc.as_str(), &mut hbuf),
+                nucleo::Utf32Str::new(keyword_lc.as_str(), &mut nbuf),
+            ) {
+                base_score += nscore as i32;
+            }
+        }
+
         res.score = base_score;
     }
 
     // 3. 最终排序 (仅根据预计算的 score)
     all_results.sort_by(|a, b| b.score.cmp(&a.score));
+
+    // P1: Top-N 高亮位置（仅最佳 30 条跑 fuzzy_indices，控制开销）
+    for res in all_results.iter_mut().take(30) {
+        let name_lc = res.name.to_lowercase();
+        let mut hbuf: Vec<char> = Vec::new();
+        let mut nbuf: Vec<char> = Vec::new();
+        let mut positions = Vec::new();
+        if matcher.fuzzy_indices(
+            nucleo::Utf32Str::new(name_lc.as_str(), &mut hbuf),
+            nucleo::Utf32Str::new(keyword_lc.as_str(), &mut nbuf),
+            &mut positions,
+        ).is_some() {
+            res.match_pos = positions;
+        }
+    }
 
     let final_results: Vec<SearchResult> = all_results.into_iter().take(100).collect();
     println!("搜索极速完成: 耗时: {:?}", start_time.elapsed());
@@ -983,4 +1206,54 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_lite_syntax() {
+        // 纯扩展名
+        let q = parse_lite_syntax("*.png");
+        assert_eq!(q.ext.as_deref(), Some("png"));
+        assert!(q.terms.is_empty());
+
+        // 混合：词 + path + size
+        let q = parse_lite_syntax("report path:/docs/ size:>100m");
+        assert_eq!(q.terms, vec!["report"]);
+        assert_eq!(q.path.as_deref(), Some("docs"));
+        assert_eq!(q.size, Some(('>', 100 * 1024 * 1024)));
+
+        // 短语（去引号保留空格）
+        let q = parse_lite_syntax("\"hello world\" ps");
+        assert_eq!(q.terms, vec!["hello world", "ps"]);
+
+        // 非法 size 降级普通词
+        let q = parse_lite_syntax("size:abc");
+        assert_eq!(q.terms, vec!["size:abc"]);
+        assert!(q.size.is_none());
+
+        // 单位换算
+        assert_eq!(parse_size(">2g"), Some(('>', 2 * 1024 * 1024 * 1024)));
+        assert_eq!(parse_size("<500k"), Some(('<', 500 * 1024)));
+        assert_eq!(parse_size(">100"), Some(('>', 100)));
+        assert_eq!(parse_size("100m"), None); // 无 >/< 不解析
+    }
+
+    #[test]
+    fn test_build_lite_query() {
+        let s = SearchStrategy::from_type("all");
+        // 扩展名查询
+        let q = parse_lite_syntax("blue *.jpg");
+        let sql = build_lite_query(&s, &q, None);
+        assert!(sql.contains("'*.jpg'cd"), "应含扩展名条件: {}", sql);
+        assert!(sql.contains("blue"), "应含关键词: {}", sql);
+
+        // 别名 OR 逃生
+        let q = parse_lite_syntax("ps");
+        let sql = build_lite_query(&s, &q, Some(&"photoshop".to_string()));
+        assert!(sql.contains("photoshop"), "应含别名: {}", sql);
+        assert!(sql.contains("||"), "别名应为 OR: {}", sql);
+    }
 }
