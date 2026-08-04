@@ -28,3 +28,13 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+
+# Local-only / build artifacts / AI tooling (never commit)
+.trae/
+_archive/
+.workbuddy/
+.backup_v41/
+dist 2/
+src/*.fixed
+src/test.js
+star-tap-fast-search-release
