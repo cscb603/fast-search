@@ -24,7 +24,7 @@ use tokio::process::Command as AsyncCommand;
 // 全局索引状态
 #[derive(Clone)]
 struct GlobalIndex {
-    files: Arc<Mutex<Vec<String>>>,
+    files: Arc<Mutex<Arc<Vec<String>>>>,
     is_indexing: Arc<Mutex<bool>>,
     force_update: Arc<AtomicBool>,
 }
@@ -45,7 +45,7 @@ fn get_index_path() -> PathBuf {
 
 impl GlobalIndex {
     fn new() -> Self {
-        let files = Arc::new(Mutex::new(Vec::new()));
+        let files = Arc::new(Mutex::new(Arc::new(Vec::new())));
         let is_indexing = Arc::new(Mutex::new(false));
         let force_update = Arc::new(AtomicBool::new(false));
         
@@ -60,7 +60,7 @@ impl GlobalIndex {
                 }
                 println!("从缓存加载了 {} 条索引", loaded_files.len());
                 let mut guard = files.lock().unwrap();
-                *guard = loaded_files;
+                *guard = Arc::new(loaded_files);
             }
         }
 
@@ -72,120 +72,131 @@ impl GlobalIndex {
         let status_clone = self.is_indexing.clone();
         let force_update_clone = self.force_update.clone();
         tauri::async_runtime::spawn(async move {
-            let mut last_volumes = std::collections::HashSet::new();
-            let mut last_full_scan = std::time::Instant::now();
-            
-            loop {
-                // 检查外接盘是否有变化
-                let mut current_volumes = std::collections::HashSet::new();
-                if let Ok(entries) = std::fs::read_dir("/Volumes") {
-                    for entry in entries.flatten() {
-                        current_volumes.insert(entry.path().to_string_lossy().to_string());
-                    }
-                }
+            // 记录当前已挂载盘，作为增量扫描的基线
+            let mut last_volumes: std::collections::HashSet<String> =
+                std::fs::read_dir("/Volumes")
+                    .map(|e| e.flatten().map(|x| x.path().to_string_lossy().to_string()).collect())
+                    .unwrap_or_default();
+            // 让首次全量在启动延迟后发生（避免一打开就狂吃资源）
+            let mut last_full_scan = std::time::Instant::now() - Duration::from_secs(700);
 
-                let volumes_changed = current_volumes != last_volumes;
-                let time_to_update = last_full_scan.elapsed() > Duration::from_secs(600);
+            // 启动延迟 6s：先让 UI 起来、用户先能搜，再开始首扫
+            sleep(Duration::from_secs(6)).await;
+
+            loop {
+                sleep(Duration::from_secs(30)).await;
+
+                let current_volumes: std::collections::HashSet<String> =
+                    std::fs::read_dir("/Volumes")
+                        .map(|e| e.flatten().map(|x| x.path().to_string_lossy().to_string()).collect())
+                        .unwrap_or_default();
+                let new_vols: std::collections::HashSet<String> =
+                    current_volumes.difference(&last_volumes).cloned().collect();
                 let force_now = force_update_clone.load(Ordering::Relaxed);
-                
-                if volumes_changed || time_to_update || force_now {
-                    println!("开始更新索引 (原因: {})...", 
-                        if force_now { "手动触发" } else if volumes_changed { "磁盘变化" } else { "定期更新" });
-                    
+
+                if force_now {
                     force_update_clone.store(false, Ordering::Relaxed);
                     last_volumes = current_volumes;
+                    run_full_scan(&files_clone, &status_clone, false).await;
                     last_full_scan = std::time::Instant::now();
-                    
-                    {
-                        let mut guard = status_clone.lock().unwrap();
-                        *guard = true;
-                    }
-                    
-                    // 扫描路径：本地常用 + 外接盘 + 应用程序
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-                    let mut scan_paths = vec![
-                        format!("{}/Desktop", home),
-                        format!("{}/Downloads", home),
-                        format!("{}/Documents", home),
-                        "/Applications".to_string(),
-                    ];
-                    
-                    if std::path::Path::new("/Volumes").exists() {
-                        scan_paths.push("/Volumes".to_string());
-                    }
-
-                    let total_paths = scan_paths.len();
-                    let mut scanned = 0usize;
-                    let mut all_files = Vec::new();
-                    for path in &scan_paths {
-                        if !std::path::Path::new(&path).exists() { continue; }
-                        println!("正在扫描路径: {} ... (已扫描 {}/{})", path, scanned, total_paths);
-
-                        let output = {
-                            let rg = AsyncCommand::new("rg")
-                                .args(["--files", "-g", "!node_modules/**", "-g", "!.git/**",
-                                       "-g", "!Library/**", "-g", "!**/Contents/MacOS/**",
-                                       "-g", "!.**"])
-                                .arg(path)
-                                .output()
-                                .await;
-                            if let Ok(ref out) = rg {
-                                if out.status.success() {
-                                    rg
-                                } else {
-                                    fallback_find(path).await
-                                }
-                            } else {
-                                fallback_find(path).await
-                            }
-                        };
-
-                        if let Ok(out) = output {
-                            let content = String::from_utf8_lossy(&out.stdout);
-                            let mut batch = Vec::new();
-                            for line in content.lines() {
-                                let p = line.to_string();
-                                if p != path.as_str() && !p.is_empty() {
-                                    batch.push(p);
-                                }
-                            }
-                            // ★ 扫完一个盘立即加入共享索引，用户马上可搜
-                            {
-                                let mut guard = files_clone.lock().unwrap();
-                                guard.extend(batch.iter().cloned());
-                            }
-                            all_files.extend(batch);
-                            scanned += 1;
-                            println!("路径 {} 扫描完成，找到 {} 个文件（已扫描 {}/{}）",
-                                path, scanned, scanned, total_paths);
-                        }
-                    }
-                    
-                    // 保存到缓存文件
-                    let index_path = get_index_path();
-                    if let Ok(mut file) = File::create(&index_path) {
-                        for f in &all_files {
-                            let _ = writeln!(file, "{}", f);
-                        }
-                    }
-
-                    let count = all_files.len();
-                    {
-                        let mut guard = files_clone.lock().unwrap();
-                        *guard = all_files;
-                    }
-                    {
-                        let mut guard = status_clone.lock().unwrap();
-                        *guard = false;
-                    }
-                    println!("索引更新完成，共 {} 条数据，已持久化到本地", count);
+                } else if !new_vols.is_empty() {
+                    // 仅增量扫描新挂载的外接盘（不重复扫已扫盘，避免卡顿）
+                    last_volumes = current_volumes;
+                    run_incremental_scan(&files_clone, &status_clone, &new_vols).await;
+                    last_full_scan = std::time::Instant::now();
+                } else if last_full_scan.elapsed() > Duration::from_secs(600) {
+                    last_volumes = current_volumes;
+                    run_full_scan(&files_clone, &status_clone, true).await;
+                    last_full_scan = std::time::Instant::now();
                 }
-                
-                // 每 30 秒检查一次外接盘状态，如果没有变化且距离上次更新超过 10 分钟，也更新一次
-                sleep(Duration::from_secs(30)).await;
             }
         });
     }
+}
+
+/// 扫描单个路径，返回该路径下（递归）的全部文件列表（rg 优先，find 兜底）
+async fn scan_path(path: &str) -> Vec<String> {
+    if !std::path::Path::new(path).exists() { return Vec::new(); }
+    let output = {
+        let rg = AsyncCommand::new("rg")
+            .args(["--files", "-g", "!node_modules/**", "-g", "!.git/**",
+                   "-g", "!Library/**", "-g", "!**/Contents/MacOS/**", "-g", "!.**"])
+            .arg(path)
+            .output()
+            .await;
+        match rg {
+            Ok(ref out) if out.status.success() => rg,
+            _ => fallback_find(path).await,
+        }
+    };
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty() && *l != path)
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 全量重建索引（本地常用目录 + /Applications；include_volumes=true 时含外接盘）
+async fn run_full_scan(
+    files_clone: &Arc<Mutex<Arc<Vec<String>>>>,
+    status_clone: &Arc<Mutex<bool>>,
+    include_volumes: bool,
+) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let mut scan_paths = vec![
+        format!("{}/Desktop", home),
+        format!("{}/Downloads", home),
+        format!("{}/Documents", home),
+        "/Applications".to_string(),
+    ];
+    if include_volumes {
+        scan_paths.push("/Volumes".to_string());
+    }
+    *status_clone.lock().unwrap() = true;
+    let mut all_files = Vec::new();
+    for p in &scan_paths {
+        let batch = scan_path(p).await;
+        println!("路径 {} 扫描完成，找到 {} 个文件", p, batch.len());
+        // 增量合并到共享索引，用户马上可搜
+        let mut cur = (**files_clone.lock().unwrap()).clone();
+        cur.extend(batch.iter().cloned());
+        *files_clone.lock().unwrap() = Arc::new(cur);
+        all_files.extend(batch);
+    }
+    let index_path = get_index_path();
+    if let Ok(mut file) = File::create(&index_path) {
+        for f in &all_files { let _ = writeln!(file, "{}", f); }
+    }
+    *files_clone.lock().unwrap() = Arc::new(all_files);
+    *status_clone.lock().unwrap() = false;
+    println!("索引更新完成，共 {} 条数据，已持久化到本地", files_clone.lock().unwrap().len());
+}
+
+/// 增量扫描新挂载的外接盘，仅合并新增文件（不重建全量，避免卡顿）
+async fn run_incremental_scan(
+    files_clone: &Arc<Mutex<Arc<Vec<String>>>>,
+    status_clone: &Arc<Mutex<bool>>,
+    vols: &std::collections::HashSet<String>,
+) {
+    *status_clone.lock().unwrap() = true;
+    let mut added: Vec<String> = Vec::new();
+    for v in vols {
+        added.extend(scan_path(v).await);
+    }
+    if !added.is_empty() {
+        let mut cur = (**files_clone.lock().unwrap()).clone();
+        cur.extend(added.iter().cloned());
+        let index_path = get_index_path();
+        if let Ok(mut file) = File::create(&index_path) {
+            for f in cur.iter() { let _ = writeln!(file, "{}", f); }
+        }
+        *files_clone.lock().unwrap() = Arc::new(cur);
+    }
+    *status_clone.lock().unwrap() = false;
+    println!("外接盘增量索引完成，新增 {} 条", added.len());
 }
 
 #[tauri::command]
@@ -339,6 +350,45 @@ fn escape_predicate(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// 是否像扩展名：纯字母数字、长度 2-5（用于把 "tiff" 这类词转成后缀匹配，命中 Spotlight 索引）
+fn is_like_ext(w: &str) -> bool {
+    !w.is_empty() && w.len() >= 2 && w.len() <= 5 && w.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// 执行一次 mdfind 查询，带超时与超时后进程清理。
+/// 超时或被取消时显式杀掉子进程（kill_on_drop 双保险），避免 mdfind 堆积导致 CPU/IO 打满
+/// —— 这是「搜 tiff 卡死一直转圈」的核心元凶之一。
+async fn run_mdfind(query: &str, scope: &str, secs: u64) -> String {
+    // kill_on_drop(true)：超时/future 丢弃时自动杀掉 mdfind 子进程，杜绝残留堆积卡死
+    let child = match AsyncCommand::new("mdfind")
+        .arg("-onlyin")
+        .arg(scope)
+        .arg(query)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+        Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 缩略图磁盘缓存（path@size -> data URI），避免重复 qlmanage（频繁搜索/切 tab 时大量省资源）
+static THUMB_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+fn thumb_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    THUMB_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+fn simple_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// P4c: Everything-lite 语法解析结果
 #[derive(Clone)]
 struct LiteQuery {
@@ -397,7 +447,7 @@ fn parse_size(s: &str) -> Option<(char, u64)> {
         else { return None; };
     let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     if num.is_empty() { return None; }
-    let unit: char = rest.chars().skip(num.len()).next().unwrap_or('b');
+    let unit: char = rest.chars().nth(num.len()).unwrap_or('b');
     let mult: u64 = match unit.to_ascii_lowercase() {
         'k' => 1024,
         'm' => 1024 * 1024,
@@ -412,10 +462,16 @@ fn build_lite_query(strategy: &SearchStrategy, lite: &LiteQuery, alias: Option<&
     let mut conds: Vec<String> = Vec::new();
     let mut term_parts: Vec<String> = Vec::new();
     for w in &lite.terms {
-        term_parts.push(format!(
+        let esc = escape_predicate(w);
+        let mut per = format!(
             "(kMDItemFSName == '*{}*'cd || kMDItemPath == '*{}*'cd)",
-            escape_predicate(w), escape_predicate(w)
-        ));
+            esc, esc
+        );
+        // 像扩展名的词额外加后缀匹配（命中 filename 索引，避免前缀通配符全库扫描）
+        if is_like_ext(w) {
+            per = format!("({} || kMDItemFSName == '*.{}'cd)", per, esc);
+        }
+        term_parts.push(per);
     }
     let base = if term_parts.is_empty() && alias.is_none() {
         None
@@ -487,43 +543,6 @@ impl SearchStrategy {
         }
     }
 
-    fn spotlight_query(&self, words: &[&str], alias: Option<&String>) -> String {
-        let mut parts = Vec::new();
-        for word in words {
-            if !word.is_empty() {
-                // P4b：文件名 OR 路径匹配（Everything 特色：路径也搜）
-                parts.push(format!(
-                    "(kMDItemFSName == '*{}*'cd || kMDItemPath == '*{}*'cd)",
-                    escape_predicate(word),
-                    escape_predicate(word)
-                ));
-            }
-        }
-
-        if parts.is_empty() && alias.is_none() {
-            return self.spotlight_kind.clone();
-        }
-
-        let base_query = if let Some(en_name) = alias {
-            let alias_part = format!("kMDItemFSName == '*{}*'cd", en_name);
-            if !parts.is_empty() {
-                format!("(({}) || {})", parts.join(" && "), alias_part)
-            } else {
-                alias_part
-            }
-        } else if parts.len() > 1 {
-            format!("({})", parts.join(" && "))
-        } else {
-            parts[0].clone()
-        };
-
-        if self.spotlight_kind.is_empty() {
-            base_query
-        } else {
-            format!("({}) && ({})", base_query, self.spotlight_kind)
-        }
-    }
-
     fn matches_extension(&self, path: &str) -> bool {
         if self.extensions.is_empty() { return true; }
         let path_lc = path.to_lowercase();
@@ -569,56 +588,20 @@ async fn search_files_internal(
         let mapping = state.mapping.lock().unwrap().clone();
         let mapped_keyword = mapping.get(&keyword_lc).cloned();
         let lite = lite.clone();
-        
+
         tokio::spawn(async move {
-            let mut results = Vec::new();
-            
             // P4c: Everything-lite + 路径匹配构造 Spotlight 查询
             let final_query = build_lite_query(&strategy, &lite, mapped_keyword.as_ref());
-            
             println!("Spotlight 原始查询: {}", final_query);
 
-            let mut tasks = vec![];
-            
-            // 任务 A: 用户目录 + 应用程序
-            let q1 = final_query.clone();
-            tasks.push(tokio::spawn(async move {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
-                let output = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    AsyncCommand::new("mdfind")
-                        .arg("-onlyin").arg(home)
-                        .arg("-onlyin").arg("/Applications")
-                        .arg(&q1)
-                        .output()
-                ).await;
-                match output {
-                    Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).to_string(),
-                    _ => String::new(),
-                }
-            }));
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
+            // 并行搜用户目录与 /Applications（run_mdfind 自带超时杀进程，杜绝 mdfind 堆积卡死）。
+            // 不扫 /Volumes：外接盘索引慢且易卡死，改由内存索引在 Spotlight 不足时兜底。
+            let (home_out, app_out) =
+                tokio::join!(run_mdfind(&final_query, &home, 3), run_mdfind(&final_query, "/Applications", 3));
+            let joined = vec![home_out, app_out];
 
-            // 任务 B: 外接盘
-            let q_vol = final_query.clone();
-            tasks.push(tokio::spawn(async move {
-                let output = tokio::time::timeout(
-                    std::time::Duration::from_secs(4),
-                    AsyncCommand::new("mdfind")
-                        .arg("-onlyin").arg("/Volumes")
-                        .arg(&q_vol)
-                        .output()
-                ).await;
-                match output {
-                    Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).to_string(),
-                    _ => String::new(),
-                }
-            }));
-
-            // 2. 并行执行所有任务
-            let task_results = futures::future::join_all(tasks).await;
-            let joined: Vec<String> = task_results.into_iter().flatten().collect();
-
-            // 3. 深度兜底（T-8 决策）：mdfind 全空时，全 $HOME rg 按关键词过滤（5s 超时，取前 100）
+            // 深度兜底（T-8 决策）：mdfind 全空时，全 $HOME rg 按关键词过滤（5s 超时，取前 100）
             let deep_results: Vec<SearchResult> = if joined.iter().all(|s| s.trim().is_empty()) {
                 let home = std::env::var("HOME").unwrap_or_default();
                 match tokio::time::timeout(
@@ -648,14 +631,14 @@ async fn search_files_internal(
                 Vec::new()
             };
 
-            // 4. 解析 mdfind 结果（获取阶段 cap 2000，防 T2 结果集爆炸）
+            // 解析 mdfind 结果（获取阶段 cap 2000，防结果集爆炸）
+            let mut results = Vec::new();
             let mut cap = 0usize;
             for content in &joined {
                 for line in content.lines() {
                     if cap >= 2000 { break; }
                     let path = line.trim().to_string();
                     if path.is_empty() || path.contains("/Contents/MacOS/") || path.contains("/Library/") { continue; }
-                    
                     let name = path.split('/').next_back().unwrap_or(&path).to_string();
                     results.push(SearchResult { path, name, score: 0, match_pos: Vec::new() });
                     cap += 1;
@@ -667,117 +650,90 @@ async fn search_files_internal(
         })
     };
 
-    let memory_handle = {
+    // 内存索引兜底搜索：先等 Spotlight 返回，仅当结果不足时才按需 spawn；
+    // 且用 Arc 零拷贝快照遍历，不持锁，避免阻塞后台索引写入（原实现持锁遍历全索引会恶性循环）。
+    let spotlight_results = spotlight_handle.await.unwrap_or_default();
+    let memory_results = if spotlight_results.len() < 15 {
         let keyword_lc = keyword_lc.clone();
         let filter_type = filter_type.clone();
         let index_files = state.index.files.clone();
         let strategy = SearchStrategy::from_type(&filter_type);
         let mapping = state.mapping.lock().unwrap().clone();
         let lite = lite.clone();
-        
-        tokio::task::spawn_blocking(move || {
-            let mut results = Vec::new();
-            let mut fallback_results = Vec::new();
-            let start = std::time::Instant::now();
-            let mapped_keyword = mapping.get(&keyword_lc).cloned();
-            
-            let volumes_exist: std::collections::HashSet<String> = if let Ok(entries) = std::fs::read_dir("/Volumes") {
-                entries.flatten().map(|e| e.path().to_string_lossy().to_string()).collect()
-            } else {
-                std::collections::HashSet::new()
-            };
-
-            let words: Vec<&str> = lite.terms.iter().map(|s| s.as_str()).collect();
-            let guard = index_files.lock().unwrap();
-            
-            for path in guard.iter() {
-                // 1. 类型预过滤 (使用 Strategy 解耦)
-                if filter_type != "all" {
-                    if filter_type == "folder" {
-                        // 改进文件夹判断逻辑：不包含点，或者是以 .app 结尾的目录（在 macOS 中 app 也是文件夹）
-                        let is_likely_dir = !path.contains('.') || path.ends_with(".app");
-                        if !is_likely_dir { continue; }
-                    } else if !strategy.matches_extension(path) {
-                        continue;
-                    }
-                }
-
-                // 2. 快速排除离线外接盘
-                if path.starts_with("/Volumes/") {
-                    let parts: Vec<&str> = path.split('/').collect();
-                    if parts.len() >= 3 {
-                        let vol_path = format!("/Volumes/{}", parts[2]);
-                        if !volumes_exist.contains(&vol_path) { continue; }
-                    }
-                }
-
-                let name = path.split('/').next_back().unwrap_or(path).to_string();
-                let name_lc = name.to_lowercase();
-                let path_lc = path.to_lowercase();
-
-                // P4c: 内存侧 ext/path 过滤
-                if let Some(ext) = &lite.ext {
-                    if !name_lc.ends_with(&format!(".{}", ext)) { continue; }
-                }
-                if let Some(p) = &lite.path {
-                    if !path_lc.contains(p) { continue; }
-                }
-                
-                // 3. 多词匹配逻辑 (仿 Everything：多词 AND 匹配)
-                let mut matched_count = 0;
-                for word in &words {
-                    if name_lc.contains(word) || path_lc.contains(word) {
-                        matched_count += 1;
-                    }
-                }
-
-                // 4. 别名与缩写补充逻辑
-                if matched_count < words.len() {
-                    // 别名映射
-                    if let Some(en_name) = mapped_keyword.as_ref() {
-                        if name_lc.contains(en_name) {
-                            matched_count = words.len();
-                        }
-                    }
-                    // 自动缩写 (如 dpp -> Digital Photo Professional)
-                    if matched_count < words.len() && keyword_lc.len() >= 2 {
-                        let initials: String = name_lc
-                            .split(|c: char| !c.is_alphanumeric())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.chars().next().unwrap_or(' '))
-                            .collect();
-                        if initials.contains(&keyword_lc) {
-                            matched_count = words.len();
-                        }
-                    }
-                }
-                
-                if matched_count == words.len() {
-                    results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
-                } else if matched_count > 0 && words.len() > 1 {
-                    // 记录部分匹配的结果，作为 fallback
-                    fallback_results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
-                }
-
-                if results.len() > 1000 { break; }
-            }
-
-            // 如果严格匹配结果太少，合并部分匹配的结果
-            if results.len() < 20 {
-                results.extend(fallback_results.into_iter().take(50));
-            }
-
-            println!("内存索引搜索耗时: {:?}", start.elapsed());
-            results
-        })
-    };
-
-    // P4a：先等 Spotlight（毫秒级）；内存索引仅在结果不足时限时兜底，不再每次全遍历拖慢
-    let spotlight_results = spotlight_handle.await.unwrap_or_default();
-    let memory_results = if spotlight_results.len() < 15 {
         match tokio::time::timeout(
             std::time::Duration::from_millis(1500),
-            memory_handle,
+            tokio::task::spawn_blocking(move || {
+                let mut results = Vec::new();
+                let mut fallback_results = Vec::new();
+                let start = std::time::Instant::now();
+                let mapped_keyword = mapping.get(&keyword_lc).cloned();
+                let volumes_exist: std::collections::HashSet<String> =
+                    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+                        entries.flatten().map(|e| e.path().to_string_lossy().to_string()).collect()
+                    } else { std::collections::HashSet::new() };
+                let words: Vec<&str> = lite.terms.iter().map(|s| s.as_str()).collect();
+                // 零拷贝快照：clone 的是 Arc，不持锁遍历
+                let snapshot = index_files.lock().unwrap().clone();
+                for path in snapshot.iter() {
+                    // 1. 类型预过滤
+                    if filter_type != "all" {
+                        if filter_type == "folder" {
+                            let is_likely_dir = !path.contains('.') || path.ends_with(".app");
+                            if !is_likely_dir { continue; }
+                        } else if !strategy.matches_extension(path) {
+                            continue;
+                        }
+                    }
+                    // 2. 快速排除离线外接盘
+                    if path.starts_with("/Volumes/") {
+                        let parts: Vec<&str> = path.split('/').collect();
+                        if parts.len() >= 3 {
+                            let vol_path = format!("/Volumes/{}", parts[2]);
+                            if !volumes_exist.contains(&vol_path) { continue; }
+                        }
+                    }
+                    let name = path.split('/').next_back().unwrap_or(path).to_string();
+                    let name_lc = name.to_lowercase();
+                    let path_lc = path.to_lowercase();
+                    // P4c: 内存侧 ext/path 过滤
+                    if let Some(ext) = &lite.ext {
+                        if !name_lc.ends_with(&format!(".{}", ext)) { continue; }
+                    }
+                    if let Some(p) = &lite.path {
+                        if !path_lc.contains(p) { continue; }
+                    }
+                    // 3. 多词匹配逻辑 (仿 Everything：多词 AND 匹配)
+                    let mut matched_count = 0;
+                    for word in &words {
+                        if name_lc.contains(word) || path_lc.contains(word) { matched_count += 1; }
+                    }
+                    // 4. 别名与缩写补充逻辑
+                    if matched_count < words.len() {
+                        if let Some(en_name) = mapped_keyword.as_ref() {
+                            if name_lc.contains(en_name) { matched_count = words.len(); }
+                        }
+                        if matched_count < words.len() && keyword_lc.len() >= 2 {
+                            let initials: String = name_lc
+                                .split(|c: char| !c.is_alphanumeric())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.chars().next().unwrap_or(' '))
+                                .collect();
+                            if initials.contains(&keyword_lc) { matched_count = words.len(); }
+                        }
+                    }
+                    if matched_count == words.len() {
+                        results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
+                    } else if matched_count > 0 && words.len() > 1 {
+                        fallback_results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
+                    }
+                    if results.len() > 1000 { break; }
+                }
+                if results.len() < 20 {
+                    results.extend(fallback_results.into_iter().take(50));
+                }
+                println!("内存索引搜索耗时: {:?}", start.elapsed());
+                results
+            })
         ).await {
             Ok(Ok(r)) => r,
             _ => Vec::new(),
@@ -1029,25 +985,32 @@ fn trigger_index_update(state: State<'_, AppCache>) -> Result<(), String> {
     Ok(())
 }
 
-/// 用 qlmanage 生成缩略图，返回 base64 data URI（前端懒加载，无缓存落盘）。
+/// 用 qlmanage 生成缩略图，返回 base64 data URI（前端懒加载）。
+/// 每个文件独立临时目录（按路径 hash），避免并发 remove_dir_all 互相删除导致失败；
+/// 命中缓存直接返回，避免频繁搜索/切 tab 时重复 qlmanage 风暴。
 #[tauri::command]
 fn get_thumbnail(path: String, size: Option<u32>) -> Result<Option<String>, String> {
     let size = size.unwrap_or(128);
-    let tmp_dir = format!("/tmp/sts-thumb-{}", std::process::id());
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let cache_key = format!("{}@{}", path, size);
+    if let Some(cached) = thumb_cache().lock().unwrap().get(&cache_key) {
+        return Ok(Some(cached.clone()));
+    }
+
+    let dir = std::env::temp_dir().join(format!("sts-thumb-{}-{}", std::process::id(), simple_hash(&path)));
+    let _ = std::fs::create_dir_all(&dir);
 
     let output = Command::new("qlmanage")
         .arg("-t")
         .arg("-s")
         .arg(size.to_string())
         .arg("-o")
-        .arg(&tmp_dir)
+        .arg(&dir)
         .arg(&path)
         .output()
         .map_err(|e| format!("qlmanage failed: {}", e))?;
 
     if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
         return Ok(None);
     }
 
@@ -1055,7 +1018,7 @@ fn get_thumbnail(path: String, size: Option<u32>) -> Result<Option<String>, Stri
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    let thumb_path = format!("{}/{}.png", tmp_dir, file_name);
+    let thumb_path = dir.join(format!("{}.png", file_name));
 
     let result = std::fs::read(&thumb_path).ok().map(|data| {
         use base64::engine::Engine;
@@ -1063,7 +1026,10 @@ fn get_thumbnail(path: String, size: Option<u32>) -> Result<Option<String>, Stri
         format!("data:image/png;base64,{}", b64)
     });
 
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Some(b64) = &result {
+        thumb_cache().lock().unwrap().insert(cache_key, b64.clone());
+    }
     Ok(result)
 }
 

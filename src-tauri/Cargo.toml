@@ -33,10 +33,3 @@ futures = "0.3.31"
 base64 = "0.22"
 nucleo = "0.5.0"
 
-[profile.release]
-opt-level = "z"       # 针对体积进行优化 (s 或 z)
-lto = true           # 开启链接时间优化 (Link Time Optimization)
-codegen-units = 1     # 减少编译单元以提高优化效果
-panic = "abort"       # 发生 panic 时直接终止，减少体积
-strip = true         # 自动移除调试符号 (去除符号表)
-

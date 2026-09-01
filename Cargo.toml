@@ -6,3 +6,10 @@ resolver = "2"
 version = "1.0.0"
 edition = "2021"
 authors = ["星TAP实验室 <cscb603@qq.com>"]
+
+# Release 优化配置（必须放在 workspace root，否则成员包的 profile 会被忽略）
+[profile.release]
+opt-level = 3
+strip = true
+codegen-units = 1
+panic = "abort"

@@ -28,6 +28,7 @@ let currentFilter = 'all';
 let lastSearchKeyword = '';
 let lastResults = []; // 最近一次搜索结果（Enter 快速打开 Top-1 用）
 let isComposing = false;
+let searchReqId = 0; // 搜索请求序号：仅渲染最后一次请求的结果，丢弃叠加的旧请求
 
 // P4e: 语法提示轮转（恰当时刻提醒用法，防"想不起来"）
 const SYNTAX_HINTS = [
@@ -78,11 +79,14 @@ async function performSearch(force = false) {
     resultsContainer.innerHTML = '<div class="loading">V5 引擎正在极速扫描...</div>';
   }
 
+  const reqId = ++searchReqId; // 仅渲染最新一次请求的结果，丢弃叠加的旧请求
   try {
     const results = await invoke("search_files", { keyword, filterType: currentFilter });
+    if (reqId !== searchReqId) return;
     lastResults = results;
     renderResults(results);
   } catch (error) {
+    if (reqId !== searchReqId) return;
     console.error("搜索出错:", error);
     resultsContainer.innerHTML = `<div class="error">搜索失败: ${error}</div>`;
   }
