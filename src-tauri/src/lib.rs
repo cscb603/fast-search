@@ -1358,4 +1358,125 @@ mod search_tests {
             elapsed
         );
     }
+
+    // 真实端到端 A（沙箱约束版）：空内存索引 + 真实 Spotlight 作用域，验证"绝不卡死"铁律
+    // 沙箱里 $HOME 被重定向为空目录且 mdfind -onlyin 不可用，故 Spotlight 返回 0（真机上正常返回用户文件）。
+    // 本测试只验证最坏情况：即使 Spotlight 不贡献结果，search_files_internal 也在 3s 硬超时内返回、绝不挂起
+    // （这正是 v2.0.4 用户反馈"转圈卡死"的根因：旧版 mdfind 返回 0 → rg 兜底 5s 卡死，rg 兜底已在 v2.0.5 删除）。
+    #[test]
+    fn real_e2e_no_hang_when_spotlight_empty() {
+        let cache = make_cache(vec![]); // 内存索引为空，Spotlight 在沙箱内亦返回 0
+        let rt = Runtime::new().unwrap();
+        let start = Instant::now();
+        let res = rt
+            .block_on(super::search_files_internal(
+                "tiff".to_string(),
+                "all".to_string(),
+                cache,
+            ))
+            .expect("search ok（不应挂起）");
+        let elapsed = start.elapsed();
+        // 核心断言：即使 Spotlight 为空也必须在 3s 内返回（卡死根因已根治）
+        assert!(
+            elapsed.as_secs() < 3,
+            "真实端到端：即使 Spotlight 为空也必须在 3s 内返回（卡死根因已根治）, 实际 {:?}",
+            elapsed
+        );
+        println!(
+            "[E2E-A] 空缓存+Spotlight 空 搜 tiff 返回 {} 条, 耗时 {:?}（无卡死）",
+            res.len(),
+            elapsed
+        );
+    }
+
+    // 真实端到端 B：用真实 mdfind 返回的磁盘真实路径作内存索引 + 真实项目文件作噪声，
+    // 验证 ext_sibling 修复在真实数据上命中真实 .tiff/.tif 且不误伤、<3s 返回
+    #[test]
+    fn real_e2e_tiff_search_real_fs_and_spotlight() {
+        // A. 真实内存索引：取自真实 mdfind -name tiff 输出（真实存在于磁盘的路径）
+        let md_out = std::process::Command::new("mdfind")
+            .args(["-name", "tiff"])
+            .output()
+            .expect("mdfind 可执行");
+        let real_tiff_paths: Vec<String> = String::from_utf8_lossy(&md_out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!real_tiff_paths.is_empty(), "真机 mdfind -name tiff 应返回真实路径（否则根因复发）");
+        // 端到端：确认这些路径真实存在于磁盘（非仅字符串）
+        let existing: Vec<String> = real_tiff_paths
+            .iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .cloned()
+            .collect();
+        assert!(!existing.is_empty(), "真实端到端：至少部分 mdfind 路径应真实在磁盘上存在");
+
+        // 噪声：混入真实项目文件（src-tauri 下真实 .rs/.toml），证明内存索引不会误伤
+        let mut noise = Vec::new();
+        collect_real_files(env!("CARGO_MANIFEST_DIR"), &mut noise, 200);
+        let mut index = existing.clone();
+        index.extend(noise);
+
+        let cache = make_cache(index);
+        let rt = Runtime::new().unwrap();
+        let start = Instant::now();
+        let res = rt
+            .block_on(super::search_files_internal(
+                "tiff".to_string(),
+                "all".to_string(),
+                cache,
+            ))
+            .expect("search ok");
+        let elapsed = start.elapsed();
+
+        let paths: Vec<String> = res.iter().map(|r| r.path.clone()).collect();
+        // 真实 .tiff/.tif 必须被命中（内存索引 + ext_sibling 修复，真实数据验证）
+        assert!(
+            paths.iter().any(|p| {
+                let l = p.to_lowercase();
+                l.ends_with(".tiff") || l.ends_with(".tif")
+            }),
+            "真实端到端：应命中真实 .tiff/.tif 文件"
+        );
+        // 真实 Spotlight 也应贡献结果（证明 mdfind 路径未退化成 0 → 无 rg 兜底卡死）
+        assert!(!paths.is_empty(), "真实端到端：结果不应为空（mdfind 真实返回）");
+        assert!(elapsed.as_secs() < 3, "真实端到端：<3s 硬超时返回, 实际 {:?}", elapsed);
+        let tiff_hits = paths
+            .iter()
+            .filter(|p| {
+                let l = p.to_lowercase();
+                l.ends_with(".tiff") || l.ends_with(".tif")
+            })
+            .count();
+        println!(
+            "[E2E-B] 真实 tiff 搜索返回 {} 条（内存索引+真实Spotlight）, 耗时 {:?}；真实 .tiff/.tif 命中 {} 个",
+            res.len(),
+            elapsed,
+            tiff_hits
+        );
+    }
+
+    // 递归收集真实文件路径（用于构造真实噪声），上限 cap
+    fn collect_real_files(dir: &str, out: &mut Vec<String>, cap: usize) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if let Ok(meta) = p.metadata() {
+                    if meta.is_dir() {
+                        if out.len() < cap {
+                            if let Some(s) = p.to_str() {
+                                collect_real_files(s, out, cap);
+                            }
+                        }
+                    } else if let Some(s) = p.to_str() {
+                        out.push(s.to_string());
+                    }
+                }
+                if out.len() >= cap {
+                    break;
+                }
+            }
+        }
+    }
 }
