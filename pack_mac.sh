@@ -16,7 +16,7 @@
 set -euo pipefail
 
 APP_NAME="星TAP 极速搜索"
-PROD_APP="src-tauri/target/release/bundle/macos/${APP_NAME}.app"
+PROD_APP="target/release/bundle/macos/${APP_NAME}.app"
 OUT_DIR="dist"
 DO_BUILD=0
 SRC_APP=""
@@ -56,6 +56,21 @@ else
 fi
 [[ -d "$APP" ]] || { echo "✗ .app 不存在: $APP"; exit 1; }
 echo ">>> 目标 app: $APP"
+
+# ---- 强制把前端拷进包（Tauri 偶发不拷 frontendDist，导致白屏空壳但图标正常）----
+# 权威坑见 mac-tauri-packaging 技能「前端漏拷（高频）」：症状 find <app>.app -name '*.html' 无结果。
+# 修复：构建后 cp -R src/. 进 Resources，再用下方 codesign 重签；最后校验 index.html 存在。
+if [[ -d "src" ]]; then
+  echo ">>> [前端] 强制 cp -R src/. -> $APP/Contents/Resources/（规避 Tauri 漏拷 frontendDist）"
+  cp -R src/. "$APP/Contents/Resources/"
+else
+  echo "✗ 找不到 src/ 前端目录"; exit 1
+fi
+if [[ ! -f "$APP/Contents/Resources/index.html" ]]; then
+  echo "✗ 前端 index.html 未进包，打包中止（白屏风险）"; exit 1
+fi
+echo ">>> [前端] 校验通过: Resources/index.html 已进包"
+
 
 # ---- 四步加固 ----
 echo ">>> [0/4] 清 AppleDouble 垃圾 ._*（ExFAT 拷入会自动生成，会搞挂 codesign --deep）"

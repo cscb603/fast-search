@@ -92,7 +92,13 @@ impl GlobalIndex {
                         .unwrap_or_default();
                 let new_vols: std::collections::HashSet<String> =
                     current_volumes.difference(&last_volumes).cloned().collect();
+                let removed_vols: std::collections::HashSet<String> =
+                    last_volumes.difference(&current_volumes).cloned().collect();
                 let force_now = force_update_clone.load(Ordering::Relaxed);
+
+                if !removed_vols.is_empty() {
+                    prune_volume_files(&files_clone, &removed_vols);
+                }
 
                 if force_now {
                     force_update_clone.store(false, Ordering::Relaxed);
@@ -106,8 +112,11 @@ impl GlobalIndex {
                     last_full_scan = std::time::Instant::now();
                 } else if last_full_scan.elapsed() > Duration::from_secs(600) {
                     last_volumes = current_volumes;
-                    run_full_scan(&files_clone, &status_clone, true).await;
+                    // 周期刷新只扫本地常用目录；外置盘靠挂载事件增量索引，不每 10 分钟重扫大盘
+                    run_full_scan(&files_clone, &status_clone, false).await;
                     last_full_scan = std::time::Instant::now();
+                } else {
+                    last_volumes = current_volumes;
                 }
             }
         });
@@ -197,6 +206,29 @@ async fn run_incremental_scan(
     }
     *status_clone.lock().unwrap() = false;
     println!("外接盘增量索引完成，新增 {} 条", added.len());
+}
+
+/// 外接盘卸载时，从内存索引 + 持久化文件剔除该盘全部文件（离线盘不再显示在结果里）
+fn prune_volume_files(
+    files_clone: &Arc<Mutex<Arc<Vec<String>>>>,
+    vols: &std::collections::HashSet<String>,
+) {
+    let cur = (**files_clone.lock().unwrap()).clone();
+    let kept: Vec<String> = cur
+        .into_iter()
+        .filter(|f| {
+            if !f.starts_with("/Volumes/") { return true; }
+            let vol = f.split('/').take(3).collect::<Vec<_>>().join("/");
+            !vols.contains(&vol)
+        })
+        .collect();
+    let n = kept.len();
+    let index_path = get_index_path();
+    if let Ok(mut file) = File::create(&index_path) {
+        for f in &kept { let _ = writeln!(file, "{}", f); }
+    }
+    *files_clone.lock().unwrap() = Arc::new(kept);
+    println!("已剔除离线盘文件，索引剩余 {} 条", n);
 }
 
 #[tauri::command]
@@ -356,17 +388,14 @@ fn is_like_ext(w: &str) -> bool {
 }
 
 /// 执行一次 mdfind 查询，带超时与超时后进程清理。
-/// 超时或被取消时显式杀掉子进程（kill_on_drop 双保险），避免 mdfind 堆积导致 CPU/IO 打满
-/// —— 这是「搜 tiff 卡死一直转圈」的核心元凶之一。
-async fn run_mdfind(query: &str, scope: &str, secs: u64) -> String {
-    // kill_on_drop(true)：超时/future 丢弃时自动杀掉 mdfind 子进程，杜绝残留堆积卡死
+/// 优先使用原生 -name 标志（实测 NSPredicate `*term*cd` 在本机返回空结果），
+/// 仅复杂查询（含 path:/ size:> 等过滤条件）才回退 NSPredicate。
+/// kill_on_drop(true) 双保险，杜绝子进程残留堆积卡死。
+async fn run_mdfind_simple(term: &str, scope: &str, secs: u64) -> String {
+    // 原生 -name 标志：mdfind -name 'jpg' → 实测返回 42 条（NSPredicate 返回 0）
     let child = match AsyncCommand::new("mdfind")
-        .arg("-onlyin")
-        .arg(scope)
-        .arg(query)
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .arg("-onlyin").arg(scope).arg("-name").arg(term)
+        .kill_on_drop(true).spawn() {
         Ok(c) => c,
         Err(_) => return String::new(),
     };
@@ -374,6 +403,38 @@ async fn run_mdfind(query: &str, scope: &str, secs: u64) -> String {
         Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
         _ => String::new(),
     }
+}
+
+/// NSPredicate 版 mdfind（仅复杂查询使用：path:/ size:> 等）
+async fn run_mdfind_predicate(query: &str, scope: &str, secs: u64) -> String {
+    let child = match AsyncCommand::new("mdfind")
+        .arg("-onlyin").arg(scope).arg(query)
+        .kill_on_drop(true).spawn() {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+        Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+        _ => String::new(),
+    }
+}
+
+/// 解析 mdfind 原始输出为 SearchResult 列表（cap 2000 防爆炸）
+fn parse_mdfind_results(joined: &[String]) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut cap = 0usize;
+    for content in joined {
+        for line in content.lines() {
+            if cap >= 2000 { break; }
+            let path = line.trim().to_string();
+            if path.is_empty() || path.contains("/Contents/MacOS/") || path.contains("/Library/") { continue; }
+            let name = path.split('/').next_back().unwrap_or(&path).to_string();
+            results.push(SearchResult { path, name, score: 0, match_pos: Vec::new() });
+            cap += 1;
+        }
+        if cap >= 2000 { break; }
+    }
+    results
 }
 
 /// 缩略图磁盘缓存（path@size -> data URI），避免重复 qlmanage（频繁搜索/切 tab 时大量省资源）
@@ -579,9 +640,18 @@ async fn search_files_internal(
     }
 
     println!("收到极速搜索请求: keyword='{}', type='{}'", keyword, filter_type);
+    let t0 = std::time::Instant::now();
 
-    // 1. 并行执行搜索任务
-    let spotlight_handle = {
+    // ── 全局硬超时：即使极端情况也不卡死（Everything 原则：查询 < 1s）──
+    let total_timeout = Duration::from_secs(3);
+
+    // 判断是否为简单查询（纯关键词，无 path:/ size:> 等复杂过滤）
+    let is_simple_query = lite.path.is_none() && lite.size.is_none() && lite.ext.is_none()
+        && lite.terms.len() <= 2;
+
+    // ── 并行执行：Spotlight + 内存索引同时跑，谁快谁先贡献结果 ──
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
+    let spotlight_task = {
         let keyword_lc = keyword_lc.clone();
         let filter_type_inner = filter_type.clone();
         let strategy = SearchStrategy::from_type(&filter_type_inner);
@@ -590,158 +660,139 @@ async fn search_files_internal(
         let lite = lite.clone();
 
         tokio::spawn(async move {
-            // P4c: Everything-lite + 路径匹配构造 Spotlight 查询
-            let final_query = build_lite_query(&strategy, &lite, mapped_keyword.as_ref());
-            println!("Spotlight 原始查询: {}", final_query);
-
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
-            // 并行搜用户目录与 /Applications（run_mdfind 自带超时杀进程，杜绝 mdfind 堆积卡死）。
-            // 不扫 /Volumes：外接盘索引慢且易卡死，改由内存索引在 Spotlight 不足时兜底。
-            let (home_out, app_out) =
-                tokio::join!(run_mdfind(&final_query, &home, 3), run_mdfind(&final_query, "/Applications", 3));
-            let joined = vec![home_out, app_out];
-
-            // 深度兜底（T-8 决策）：mdfind 全空时，全 $HOME rg 按关键词过滤（5s 超时，取前 100）
-            let deep_results: Vec<SearchResult> = if joined.iter().all(|s| s.trim().is_empty()) {
-                let home = std::env::var("HOME").unwrap_or_default();
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    AsyncCommand::new("rg")
-                        .args(["--files", "-g", "!node_modules/**", "-g", "!.git/**",
-                               "-g", "!Library/**", "-g", "!**/Contents/MacOS/**", "-g", "!.**"])
-                        .arg(&home)
-                        .output()
-                ).await {
-                    Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .filter(|p| !p.is_empty())
-                        .filter(|p| {
-                            let n = p.split('/').next_back().unwrap_or("").to_lowercase();
-                            n.contains(&keyword_lc)
-                        })
-                        .take(100)
-                        .map(|p| {
-                            let name = p.split('/').next_back().unwrap_or(p).to_string();
-                            SearchResult { path: p.to_string(), name, score: 0, match_pos: Vec::new() }
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                }
+            if is_simple_query && !lite.terms.is_empty() {
+                // 简单查询：用原生 -name 标志（实测 NSPredicate *term*cd 返回空）
+                // 只取第一个词作为 -name 参数（mdfind -name 不支持多词 AND）
+                let term = &lite.terms[0];
+                println!("[SPOTLIGHT] 简单查询: mdfind -name '{}'", term);
+                let (home_out, app_out) = tokio::join!(
+                    run_mdfind_simple(term, &home, 2),
+                    run_mdfind_simple(term, "/Applications", 2)
+                );
+                let joined = vec![home_out, app_out];
+                parse_mdfind_results(&joined)
             } else {
-                Vec::new()
-            };
-
-            // 解析 mdfind 结果（获取阶段 cap 2000，防结果集爆炸）
-            let mut results = Vec::new();
-            let mut cap = 0usize;
-            for content in &joined {
-                for line in content.lines() {
-                    if cap >= 2000 { break; }
-                    let path = line.trim().to_string();
-                    if path.is_empty() || path.contains("/Contents/MacOS/") || path.contains("/Library/") { continue; }
-                    let name = path.split('/').next_back().unwrap_or(&path).to_string();
-                    results.push(SearchResult { path, name, score: 0, match_pos: Vec::new() });
-                    cap += 1;
-                }
-                if cap >= 2000 { break; }
+                // 复杂查询（含 ext/path/size）：回退 NSPredicate
+                let final_query = build_lite_query(&strategy, &lite, mapped_keyword.as_ref());
+                println!("[SPOTLIGHT] 复杂查询: {}", final_query);
+                let (home_out, app_out) = tokio::join!(
+                    run_mdfind_predicate(&final_query, &home, 2),
+                    run_mdfind_predicate(&final_query, "/Applications", 2)
+                );
+                let joined = vec![home_out, app_out];
+                parse_mdfind_results(&joined)
             }
-            results.extend(deep_results);
-            results
         })
     };
 
-    // 内存索引兜底搜索：先等 Spotlight 返回，仅当结果不足时才按需 spawn；
-    // 且用 Arc 零拷贝快照遍历，不持锁，避免阻塞后台索引写入（原实现持锁遍历全索引会恶性循环）。
-    let spotlight_results = spotlight_handle.await.unwrap_or_default();
-    let memory_results = if spotlight_results.len() < 15 {
+    let memory_task = {
         let keyword_lc = keyword_lc.clone();
         let filter_type = filter_type.clone();
         let index_files = state.index.files.clone();
         let strategy = SearchStrategy::from_type(&filter_type);
         let mapping = state.mapping.lock().unwrap().clone();
-        let lite = lite.clone();
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(1500),
-            tokio::task::spawn_blocking(move || {
-                let mut results = Vec::new();
-                let mut fallback_results = Vec::new();
-                let start = std::time::Instant::now();
-                let mapped_keyword = mapping.get(&keyword_lc).cloned();
-                let volumes_exist: std::collections::HashSet<String> =
-                    if let Ok(entries) = std::fs::read_dir("/Volumes") {
-                        entries.flatten().map(|e| e.path().to_string_lossy().to_string()).collect()
-                    } else { std::collections::HashSet::new() };
-                let words: Vec<&str> = lite.terms.iter().map(|s| s.as_str()).collect();
-                // 零拷贝快照：clone 的是 Arc，不持锁遍历
-                let snapshot = index_files.lock().unwrap().clone();
-                for path in snapshot.iter() {
-                    // 1. 类型预过滤
-                    if filter_type != "all" {
-                        if filter_type == "folder" {
-                            let is_likely_dir = !path.contains('.') || path.ends_with(".app");
-                            if !is_likely_dir { continue; }
-                        } else if !strategy.matches_extension(path) {
-                            continue;
-                        }
+        let lite_for_mem = lite.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            let mut fallback_results = Vec::new();
+            let start = std::time::Instant::now();
+            let mapped_keyword = mapping.get(&keyword_lc).cloned();
+            let volumes_exist: std::collections::HashSet<String> =
+                if let Ok(entries) = std::fs::read_dir("/Volumes") {
+                    entries.flatten().map(|e| e.path().to_string_lossy().to_string()).collect()
+                } else { std::collections::HashSet::new() };
+            let words: Vec<&str> = lite_for_mem.terms.iter().map(|s| s.as_str()).collect();
+            let snapshot = index_files.lock().unwrap().clone();
+            
+            // 扩展名预过滤（最便宜的检查，先排除大量不匹配项）
+            let quick_ext_filter = lite_for_mem.ext.as_ref().map(|ext| format!(".{}", ext));
+            // 是否为常见扩展名（这类词不应触发缩写匹配）
+            let is_common_ext = words.len() == 1 && matches!(words[0], "jpg"|"jpeg"|"png"|"gif"|"mp4"|"pdf"|"doc"|"txt"|"tiff"|"tif");
+
+            for path in snapshot.iter() {
+                // 1. 类型预过滤
+                if filter_type != "all" {
+                    if filter_type == "folder" {
+                        let is_likely_dir = !path.contains('.') || path.ends_with(".app");
+                        if !is_likely_dir { continue; }
+                    } else if !strategy.matches_extension(path) {
+                        continue;
                     }
-                    // 2. 快速排除离线外接盘
-                    if path.starts_with("/Volumes/") {
-                        let parts: Vec<&str> = path.split('/').collect();
-                        if parts.len() >= 3 {
-                            let vol_path = format!("/Volumes/{}", parts[2]);
-                            if !volumes_exist.contains(&vol_path) { continue; }
-                        }
-                    }
-                    let name = path.split('/').next_back().unwrap_or(path).to_string();
-                    let name_lc = name.to_lowercase();
-                    let path_lc = path.to_lowercase();
-                    // P4c: 内存侧 ext/path 过滤
-                    if let Some(ext) = &lite.ext {
-                        if !name_lc.ends_with(&format!(".{}", ext)) { continue; }
-                    }
-                    if let Some(p) = &lite.path {
-                        if !path_lc.contains(p) { continue; }
-                    }
-                    // 3. 多词匹配逻辑 (仿 Everything：多词 AND 匹配)
-                    let mut matched_count = 0;
-                    for word in &words {
-                        if name_lc.contains(word) || path_lc.contains(word) { matched_count += 1; }
-                    }
-                    // 4. 别名与缩写补充逻辑
-                    if matched_count < words.len() {
-                        if let Some(en_name) = mapped_keyword.as_ref() {
-                            if name_lc.contains(en_name) { matched_count = words.len(); }
-                        }
-                        if matched_count < words.len() && keyword_lc.len() >= 2 {
-                            let initials: String = name_lc
-                                .split(|c: char| !c.is_alphanumeric())
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.chars().next().unwrap_or(' '))
-                                .collect();
-                            if initials.contains(&keyword_lc) { matched_count = words.len(); }
-                        }
-                    }
-                    if matched_count == words.len() {
-                        results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
-                    } else if matched_count > 0 && words.len() > 1 {
-                        fallback_results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
-                    }
-                    if results.len() > 1000 { break; }
                 }
-                if results.len() < 20 {
-                    results.extend(fallback_results.into_iter().take(50));
+                // 2. 快速排除离线外接盘
+                if path.starts_with("/Volumes/") {
+                    let parts: Vec<&str> = path.split('/').collect();
+                    if parts.len() >= 3 {
+                        let vol_path = format!("/Volumes/{}", parts[2]);
+                        if !volumes_exist.contains(&vol_path) { continue; }
+                    }
                 }
-                println!("内存索引搜索耗时: {:?}", start.elapsed());
-                results
-            })
-        ).await {
-            Ok(Ok(r)) => r,
-            _ => Vec::new(),
-        }
-    } else {
-        Vec::new()
+                // 3. 扩展名快速过滤（在分配 name/to_lowercase 之前）
+                if let Some(ref qext) = quick_ext_filter {
+                    if !path.to_lowercase().ends_with(qext.as_str()) { continue; }
+                }
+                let name = path.split('/').next_back().unwrap_or(path).to_string();
+                let name_lc = name.to_lowercase();
+                let path_lc = path.to_lowercase();
+                // 4. 内存侧 ext/path 过滤
+                if let Some(ext) = &lite_for_mem.ext {
+                    if !name_lc.ends_with(&format!(".{}", ext)) { continue; }
+                }
+                if let Some(p) = &lite_for_mem.path {
+                    if !path_lc.contains(p) { continue; }
+                }
+                // 5. 多词匹配逻辑
+                let mut matched_count = 0;
+                for word in &words {
+                    if name_lc.contains(word) || path_lc.contains(word) { matched_count += 1; }
+                }
+                // 6. 别名补充（仅精确别名，不触发缩写噪声）
+                if matched_count < words.len() {
+                    if let Some(en_name) = mapped_keyword.as_ref() {
+                        if name_lc.contains(en_name) { matched_count = words.len(); }
+                    }
+                    // 缩写匹配限制：仅对 ≥3 字符且非常见扩展名的查询启用
+                    // （修复 "tiff" 匹配到 522 个无关文件缩写的噪声问题）
+                    if matched_count < words.len() && !is_common_ext && keyword_lc.len() >= 3 && words.len() == 1 {
+                        let initials: String = name_lc
+                            .split(|c: char| !c.is_alphanumeric())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.chars().next().unwrap_or(' '))
+                            .collect();
+                        if initials.contains(&keyword_lc) { matched_count = words.len(); }
+                    }
+                }
+                if matched_count == words.len() {
+                    results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
+                } else if matched_count > 0 && words.len() > 1 {
+                    fallback_results.push(SearchResult { path: path.clone(), name, score: 0, match_pos: Vec::new() });
+                }
+                if results.len() > 1000 { break; }
+            }
+            if results.len() < 20 {
+                results.extend(fallback_results.into_iter().take(50));
+            }
+            println!("[MEMORY] 搜索耗时: {:?}, 结果数: {}", start.elapsed(), results.len());
+            results
+        })
     };
-    
+
+    // ── 并行等待两个搜索源，全局 3s 超时保护 ──
+    let (spotlight_results, memory_results) = match tokio::time::timeout(total_timeout, async {
+        let s = spotlight_task.await.unwrap_or_default();
+        let m = memory_task.await.unwrap_or_default();
+        (s, m)
+    }).await {
+        Ok((s, m)) => (s, m),
+        Err(_) => {
+            println!("[TIMEOUT] 全局 3s 超时！返回已有结果");
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    println!("[TIMING] 全部搜索完成: 耗时: {:?}, spotlight={}, memory={}", 
+             t0.elapsed(), spotlight_results.len(), memory_results.len());
     println!("Spotlight 返回: {} 条, 内存索引返回: {} 条", spotlight_results.len(), memory_results.len());
     
     let mut all_results = [spotlight_results, memory_results].concat();

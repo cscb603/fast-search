@@ -84,7 +84,8 @@ async function performSearch(force = false) {
     const results = await invoke("search_files", { keyword, filterType: currentFilter });
     if (reqId !== searchReqId) return;
     lastResults = results;
-    renderResults(results);
+    // 渐进式渲染：先出首屏 20 条（用户 < 100ms 看到结果），后台补完剩余
+    renderResultsProgressive(results);
   } catch (error) {
     if (reqId !== searchReqId) return;
     console.error("搜索出错:", error);
@@ -148,7 +149,8 @@ function groupResults(results) {
   return order.map(([k, label]) => ({ label, items: groups[k] })).filter(g => g.items.length > 0);
 }
 
-function renderResults(results) {
+// 渐进式渲染：先出首屏 20 条（用户 < 100ms 看到结果），后台用 rAF 补完剩余
+function renderResultsProgressive(results) {
   resultsContainer.innerHTML = '';
   
   if (results.length === 0) {
@@ -157,92 +159,122 @@ function renderResults(results) {
   }
 
   const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'svg', 'bmp', 'tiff', 'tif'];
-  let thumbQueue = [];
-
+  
   const groups = groupResults(results);
+  // 首次渲染：只渲染每个分组的前 5 条（首屏 ~20 条，< 50ms）
+  let renderedCount = 0;
   groups.forEach(group => {
-    // 分组头（P4d）
     const header = document.createElement('div');
     header.className = 'group-header';
     header.textContent = `${group.label} (${group.items.length})`;
     resultsContainer.appendChild(header);
-
-    group.items.forEach(result => {
-      if (!result.name || !result.path || result.name.trim() === "" || result.path.trim() === "") {
-          return;
-      }
-
-      const item = document.createElement('div');
-      item.className = 'result-item';
-      item.ondblclick = () => openFile(result.path);
-
-      const ext = result.name.split('.').pop().toLowerCase();
-      const isImage = imageExts.includes(ext);
-      const icon = getFileIcon(result);
-
-      item.innerHTML = `
-        <div class="result-icon-box" data-thumb-path="${isImage ? encodeURIComponent(result.path) : ''}">${icon}</div>
-        <div class="result-info">
-          <span class="result-name">${highlightName(result.name, result.match_pos)}</span>
-          <span class="result-path">${result.path}</span>
-        </div>
-        <div class="result-actions">
-          <button class="action-btn copy-btn" title="复制路径">复制</button>
-          <button class="action-btn open-btn" title="直接打开">打开</button>
-          <button class="action-btn folder-btn" title="打开所在位置">位置</button>
-        </div>
-      `;
-
-      // 绑定事件
-      item.querySelector('.copy-btn').onclick = (e) => {
-          e.stopPropagation();
-          copyPath(result.path, e.target);
-      };
-      item.querySelector('.open-btn').onclick = (e) => {
-          e.stopPropagation();
-          openFile(result.path);
-      };
-      item.querySelector('.folder-btn').onclick = (e) => {
-          e.stopPropagation();
-          openFolder(result.path);
-      };
-      item.querySelector('.result-info').onclick = (e) => {
-          openFile(result.path);
-      };
-
-      resultsContainer.appendChild(item);
-
-      // 图片文件入队，后续批量加载缩略图
-      if (isImage) {
-        thumbQueue.push(result.path);
-      }
-    });
+    
+    const firstBatch = group.items.slice(0, 5);
+    firstBatch.forEach(result => appendResultItem(result, imageExts));
+    renderedCount += firstBatch.length;
+    
+    // 标记剩余项待渲染
+    if (group.items.length > 5) {
+      const placeholder = document.createElement('div');
+      placeholder.className = 'more-placeholder';
+      placeholder.dataset.groupIdx = groups.indexOf(group);
+      placeholder.dataset.offset = 5;
+      placeholder.textContent = `... 还有 ${group.items.length - 5} 项`;
+      resultsContainer.appendChild(placeholder);
+    }
   });
 
-  // 批量懒加载缩略图（最多同时 3 个，避免 qlmanage 风暴）
-  if (thumbQueue.length > 0) {
-    let idx = 0;
-    const loadNext = () => {
-      if (idx >= thumbQueue.length) return;
-      const path = thumbQueue[idx++];
-      const box = document.querySelector(`.result-icon-box[data-thumb-path="${encodeURIComponent(path)}"]`);
-      if (!box) { loadNext(); return; }
+  // 后台用 rAF 分批补完剩余结果（不阻塞用户交互）
+  if (renderedCount < results.length) {
+    requestAnimationFrame(() => {
+      const placeholders = resultsContainer.querySelectorAll('.more-placeholder');
+      placeholders.forEach(ph => {
+        const gIdx = parseInt(ph.dataset.groupIdx);
+        const offset = parseInt(ph.dataset.offset);
+        const group = groups[gIdx];
+        const remaining = group.items.slice(offset);
+        
+        ph.replaceWith(document.createDocumentFragment());
+        remaining.forEach(result => appendResultItem(result, imageExts));
+      });
+      
+      // 缩略图懒加载：只用 IntersectionObserver 加载可见项
+      initThumbnailLazyLoad(imageExts);
+    });
+  } else {
+    // 结果少，直接加载缩略图
+    initThumbnailLazyLoad(imageExts);
+  }
+}
+
+// 追加单条结果到容器（从 renderResults 提取的公共逻辑）
+function appendResultItem(result, imageExts) {
+  if (!result.name || !result.path || result.name.trim() === "" || result.path.trim() === "") return;
+
+  const item = document.createElement('div');
+  item.className = 'result-item';
+  item.ondblclick = () => openFile(result.path);
+
+  const ext = (result.name.split('.').pop() || '').toLowerCase();
+  const isImage = imageExts.includes(ext);
+  const icon = getFileIcon(result);
+
+  item.innerHTML = `
+    <div class="result-icon-box" data-thumb-path="${isImage ? encodeURIComponent(result.path) : ''}">${icon}</div>
+    <div class="result-info">
+      <span class="result-name">${highlightName(result.name, result.match_pos)}</span>
+      <span class="result-path">${result.path}</span>
+    </div>
+    <div class="result-actions">
+      <button class="action-btn copy-btn" title="复制路径">复制</button>
+      <button class="action-btn open-btn" title="直接打开">打开</button>
+      <button class="action-btn folder-btn" title="打开所在位置">位置</button>
+    </div>
+  `;
+
+  item.querySelector('.copy-btn').onclick = (e) => { e.stopPropagation(); copyPath(result.path, e.target); };
+  item.querySelector('.open-btn').onclick = (e) => { e.stopPropagation(); openFile(result.path); };
+  item.querySelector('.folder-btn').onclick = (e) => { e.stopPropagation(); openFolder(result.path); };
+  item.querySelector('.result-info').onclick = () => openFile(result.path);
+
+  resultsContainer.appendChild(item);
+}
+
+// IntersectionObserver 懒加载缩略图：只在可见时触发 qlmanage（替代全量入队）
+function initThumbnailLazyLoad(imageExts) {
+  const thumbBoxes = resultsContainer.querySelectorAll('.result-icon-box[data-thumb-path]');
+  if (thumbBoxes.length === 0) return;
+  
+  const observer = new IntersectionObserver((entries, obs) => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      const box = entry.target;
+      const path = decodeURIComponent(box.dataset.thumbPath);
+      obs.unobserve(box); // 只加载一次
+      
       invoke('get_thumbnail', { path, size: 96 })
         .then(b64 => {
-          if (b64) {
-            box.innerHTML = `<img src="${b64}" class="thumb-img" alt="缩略图" style="width:48px;height:48px;border-radius:6px;object-fit:cover;">`;
-          }
+          if (b64) box.innerHTML = `<img src="${b64}" class="thumb-img" alt="缩略图" style="width:48px;height:48px;border-radius:6px;object-fit:cover;">`;
         })
-        .catch(() => {})
-        .finally(() => {
-          setTimeout(loadNext, 100);
-        });
-    };
-    // 启动 3 个并行加载
-    loadNext();
-    loadNext();
-    loadNext();
-  }
+        .catch(() => {});
+    });
+  }, { rootMargin: '50px' }); // 预加载视口下方 50px
+  
+  thumbBoxes.forEach(box => observer.observe(box));
+  // 同时启动前 3 个（首屏立即可见）
+  Array.from(thumbBoxes).slice(0, 3).forEach((box, i) => {
+    setTimeout(() => {
+      const path = decodeURIComponent(box.dataset.thumbPath);
+      invoke('get_thumbnail', { path, size: 96 })
+        .then(b64 => { if (b64) box.innerHTML = `<img src="${b64}" class="thumb-img" ...>`; })
+        .catch(() => {});
+    }, i * 80);
+  });
+}
+
+function renderResults(results) {
+  // 兼容旧调用（无渐进式）
+  renderResultsProgressive(results);
 }
 
 async function openFile(path) {
