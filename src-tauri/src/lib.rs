@@ -626,6 +626,17 @@ async fn search_files(
     search_files_internal(keyword, filter_type, state.inner().clone()).await
 }
 
+// 常见扩展名兄弟形式：tiff<->tif, jpeg<->jpg（查询其一也应命中另一种写法）
+fn ext_sibling(ext: &str) -> Option<&'static str> {
+    match ext {
+        "tiff" => Some("tif"),
+        "tif" => Some("tiff"),
+        "jpeg" => Some("jpg"),
+        "jpg" => Some("jpeg"),
+        _ => None,
+    }
+}
+
 async fn search_files_internal(
     keyword: String, 
     filter_type: String, 
@@ -746,6 +757,14 @@ async fn search_files_internal(
                 let mut matched_count = 0;
                 for word in &words {
                     if name_lc.contains(word) || path_lc.contains(word) { matched_count += 1; }
+                }
+                // 5b. 单常见扩展名：兄弟形式亦视为命中（tiff<->tif, jpg<->jpeg）
+                if matched_count < words.len() && is_common_ext && words.len() == 1 {
+                    if let Some(sib) = ext_sibling(words[0]) {
+                        if name_lc.contains(sib) || path_lc.contains(sib) {
+                            matched_count = words.len();
+                        }
+                    }
                 }
                 // 6. 别名补充（仅精确别名，不触发缩写噪声）
                 if matched_count < words.len() {
@@ -1272,5 +1291,71 @@ mod tests {
         let sql = build_lite_query(&s, &q, Some(&"photoshop".to_string()));
         assert!(sql.contains("photoshop"), "应含别名: {}", sql);
         assert!(sql.contains("||"), "别名应为 OR: {}", sql);
+    }
+}
+
+
+#[cfg(test)]
+mod search_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use tokio::runtime::Runtime;
+
+    use crate::{AppCache, GlobalIndex};
+
+    // 复刻 AppCache 最小构造（不触发真实索引扫描/文件 IO）
+    fn make_cache(index_paths: Vec<String>) -> AppCache {
+        let files = Arc::new(Mutex::new(Arc::new(index_paths)));
+        let index = GlobalIndex {
+            files,
+            is_indexing: Arc::new(Mutex::new(false)),
+            force_update: Arc::new(AtomicBool::new(false)),
+        };
+        AppCache {
+            mapping: Arc::new(Mutex::new(HashMap::new())),
+            click_history: Arc::new(Mutex::new(HashMap::new())),
+            index,
+        }
+    }
+
+    // 回归测试：tiff 搜索应秒回、且不被缩写噪声误伤（v2.0.5 根治点）
+    #[test]
+    fn tiff_search_is_fast_and_noise_free() {
+        let index = vec![
+            "/Users/xtap/Pictures/photo.tiff".to_string(),
+            "/Users/xtap/Documents/report.TIFF".to_string(),
+            "/Users/xtap/Downloads/scan_2024.tif".to_string(),
+            // 缩写噪声：tiff 绝不应匹配到这类文件名
+            "/Users/xtap/Documents/this.is.fine.friend.txt".to_string(),
+            "/Users/xtap/Movies/clip.mp4".to_string(),
+        ];
+        let cache = make_cache(index);
+        let rt = Runtime::new().unwrap();
+        let start = Instant::now();
+        let res = rt
+            .block_on(super::search_files_internal(
+                "tiff".to_string(),
+                "all".to_string(),
+                cache,
+            ))
+            .expect("search ok");
+        let elapsed = start.elapsed();
+
+        let paths: Vec<&str> = res.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("photo.tiff")), "应命中真实 .tiff");
+        assert!(paths.iter().any(|p| p.ends_with("report.TIFF")), "应命中大写 .TIFF");
+        assert!(paths.iter().any(|p| p.ends_with("scan_2024.tif")), "应命中 .tif");
+        assert!(
+            !paths.iter().any(|p| p.contains("this.is.fine.friend")),
+            "缩写噪声 this.is.fine.friend 不应被 tiff 匹配"
+        );
+        assert!(elapsed.as_secs() < 3, "搜索应在 3s 硬超时内返回, 实际 {:?}", elapsed);
+        println!(
+            "[TEST] tiff 搜索返回 {} 条, 耗时 {:?}（内存索引路径验证通过）",
+            res.len(),
+            elapsed
+        );
     }
 }
